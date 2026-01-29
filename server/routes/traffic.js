@@ -2,6 +2,7 @@ import express from 'express';
 import Cap from 'cap';
 import { spawn } from 'child_process';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -84,18 +85,24 @@ function buildFrame(options) {
 
 // Get interface MAC address
 function getInterfaceMac(ifaceName) {
+  // Try reading from /sys/class/net first (most reliable for Linux)
+  try {
+    const macPath = `/sys/class/net/${ifaceName}/address`;
+    if (fs.existsSync(macPath)) {
+      return fs.readFileSync(macPath, 'utf8').trim();
+    }
+  } catch (e) {}
+
+  // Fallback to libpcap device list
   const devices = CapLib.deviceList();
   const device = devices.find(d => d.name === ifaceName);
   if (device && device.addresses) {
-    // Find hardware address (MAC)
     for (const addr of device.addresses) {
       if (addr.addr && addr.addr.includes(':') && addr.addr.length === 17) {
-        // Looks like a MAC address
         return addr.addr;
       }
     }
   }
-  // Return a default if not found
   return '00:00:00:00:00:00';
 }
 
@@ -365,11 +372,11 @@ router.post('/start-precision', (req, res) => {
     String(duration)
   ];
 
-  console.log(`Starting C sender: sudo ${senderPath} ${args.join(' ')}`);
+  console.log(`Starting C sender: ${senderPath} ${args.join(' ')}`);
 
   try {
-    // Use sudo for raw socket access
-    cSenderProcess = spawn('sudo', [senderPath, ...args], {
+    // Binary has CAP_NET_RAW capability, no sudo needed
+    cSenderProcess = spawn(senderPath, args, {
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
@@ -428,14 +435,12 @@ router.post('/stop-precision', (req, res) => {
   if (cSenderProcess) {
     try {
       cSenderProcess.kill('SIGTERM');
-      // Also kill via sudo
-      spawn('sudo', ['pkill', '-f', 'traffic-sender'], { stdio: 'ignore' });
+      spawn('pkill', ['-f', 'traffic-sender'], { stdio: 'ignore' });
     } catch (e) {}
     cSenderProcess = null;
     res.json({ success: true, message: 'Precision traffic stopped' });
   } else {
-    // Try to kill anyway in case it's orphaned
-    spawn('sudo', ['pkill', '-f', 'traffic-sender'], { stdio: 'ignore' });
+    spawn('pkill', ['-f', 'traffic-sender'], { stdio: 'ignore' });
     res.json({ success: true, message: 'No active precision traffic' });
   }
 });

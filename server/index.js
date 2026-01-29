@@ -28,6 +28,8 @@ import rpcRoutes from './routes/rpc.js';
 import captureRoutes, { setWsClients, getCaptureState } from './routes/capture.js';
 import trafficRoutes from './routes/traffic.js';
 import ptpRoutes from './routes/ptp.js';
+import tasRoutes from './routes/tas.js';
+import systemRoutes from './routes/system.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -90,20 +92,26 @@ app.use('/api/rpc', rpcRoutes);
 app.use('/api/capture', captureRoutes);
 app.use('/api/traffic', trafficRoutes);
 app.use('/api/ptp', ptpRoutes);
+app.use('/api/tas', tasRoutes);
+app.use('/api/system', systemRoutes);
 
 // Health check (must be before static wildcard)
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), uptime: process.uptime() });
 });
 
-// Serve static files in production (must be last)
-const clientBuildPath = join(__dirname, '../client/dist');
-if (fs.existsSync(clientBuildPath)) {
-  app.use(express.static(clientBuildPath));
-  app.get('*', (req, res) => {
-    res.sendFile(join(clientBuildPath, 'index.html'));
-  });
-}
+// Serve static files from public/ directory
+const publicPath = join(__dirname, '../public');
+app.use(express.static(publicPath));
+
+// SPA fallback - serve index.html for all non-API routes
+app.get('*', (req, res) => {
+  if (!req.path.startsWith('/api')) {
+    res.sendFile(join(publicPath, 'index.html'));
+  } else {
+    res.status(404).json({ error: 'API endpoint not found' });
+  }
+});
 
 server.listen(PORT, () => {
   console.log(`TSN UI Server running on http://localhost:${PORT}`);

@@ -1,0 +1,37 @@
+{
+  "server": {
+    "port": 3000,
+    "host": "0.0.0.0"
+  },
+  "board": {
+    "transport": "serial",
+    "device": "/dev/ttyACM0",
+    "wifiHost": "192.168.4.1",
+    "wifiPort": 5683
+  },
+  "interfaces": {
+    "autoDetect": true,
+    "profiles": [
+      {
+        "id": "default",
+        "name": "Default Profile",
+        "tx": "auto",
+        "rx": "auto",
+        "vlan": 100,
+        "pps": 100,
+        "duration": 5
+      }
+    ],
+    "activeProfile": "default"
+  },
+  "capture": {
+    "defaultDuration": 10,
+    "defaultVlan": 100,
+    "outputMode": "json"
+  },
+  "traffic": {
+    "defaultPps": 100,
+    "defaultDuration": 5,
+    "defaultTcList": [1, 2, 3]
+  }
+}
