@@ -77,6 +77,14 @@ export const api = {
     getPorts: () => api.get('/api/tas/ports'),
     configure: (port, config) => api.post(`/api/tas/configure/${port}`, config),
     enable: (port, enabled = true) => api.post(`/api/tas/enable/${port}`, { enabled })
+  },
+
+  // ========== CBS ==========
+  cbs: {
+    getStatus: (port) => api.get(`/api/cbs/status/${port}`),
+    getPorts: () => api.get('/api/cbs/ports'),
+    configure: (port, config) => api.post(`/api/cbs/configure/${port}`, config),
+    estimate: (options) => api.post('/api/cbs/estimate', options)
   }
 };
 

@@ -29,6 +29,7 @@ import captureRoutes, { setWsClients, getCaptureState } from './routes/capture.j
 import trafficRoutes from './routes/traffic.js';
 import ptpRoutes from './routes/ptp.js';
 import tasRoutes from './routes/tas.js';
+import cbsRoutes from './routes/cbs.js';
 import systemRoutes from './routes/system.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -93,6 +94,7 @@ app.use('/api/capture', captureRoutes);
 app.use('/api/traffic', trafficRoutes);
 app.use('/api/ptp', ptpRoutes);
 app.use('/api/tas', tasRoutes);
+app.use('/api/cbs', cbsRoutes);
 app.use('/api/system', systemRoutes);
 
 // Health check (must be before static wildcard)
