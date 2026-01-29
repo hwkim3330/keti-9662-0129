@@ -177,11 +177,16 @@ router.post('/start', (req, res) => {
     });
 
     const pps = Math.max(1, Math.min(100000, parseInt(packetsPerSecond) || 100));
-    const interval = Math.floor(1000 / pps); // ms between packets
+
+    // For high PPS, use burst mode (send multiple packets per interval)
+    // setInterval has ~1ms minimum resolution, so for >1000 pps we need bursts
+    const intervalMs = pps > 1000 ? 1 : Math.max(1, Math.floor(1000 / pps));
+    const packetsPerBurst = pps > 1000 ? Math.ceil(pps / 1000) : 1;
 
     const stats = {
       sent: 0,
       errors: 0,
+      bytes: 0,
       startTime: Date.now(),
       running: true
     };
@@ -189,7 +194,7 @@ router.post('/start', (req, res) => {
     const maxPackets = parseInt(count) || 0;
     const maxDuration = (parseInt(duration) || 0) * 1000; // Convert to ms
 
-    // Send packets at specified rate
+    // Send packets at specified rate (with burst support)
     const sendPacket = () => {
       if (!stats.running) return;
 
@@ -204,23 +209,27 @@ router.post('/start', (req, res) => {
         return;
       }
 
-      try {
-        cap.send(frame, frame.length);
-        stats.sent++;
-      } catch (err) {
-        stats.errors++;
+      // Send burst of packets
+      for (let i = 0; i < packetsPerBurst; i++) {
+        try {
+          cap.send(frame, frame.length);
+          stats.sent++;
+          stats.bytes += frame.length;
+        } catch (err) {
+          stats.errors++;
+        }
       }
     };
 
     // Use setInterval for rate control
-    const timer = setInterval(sendPacket, interval);
+    const timer = setInterval(sendPacket, intervalMs);
 
     generators.set(generatorKey, {
       cap,
       timer,
       stats,
       ifaceName,
-      config: { dstMac, srcMac: sourceMac, vlanId, pcp: pcpValue, packetSize, packetsPerSecond: pps }
+      config: { dstMac, srcMac: sourceMac, vlanId, pcp: pcpValue, packetSize: frame.length, packetsPerSecond: pps, packetsPerBurst }
     });
 
     res.json({
@@ -338,7 +347,8 @@ router.post('/start-precision', (req, res) => {
     vlanId = 100,
     tcList = [1, 2, 3, 4, 5, 6, 7],
     packetsPerSecond = 100,
-    duration = 7
+    duration = 7,
+    frameSize = 1000  // Default 1000 bytes for ~8Mbps per TC at 1000 pps
   } = req.body;
 
   if (!ifaceName || !dstMac) {
@@ -369,7 +379,8 @@ router.post('/start-precision', (req, res) => {
     String(vlanId),
     tcListStr,
     String(packetsPerSecond),
-    String(duration)
+    String(duration),
+    String(frameSize)
   ];
 
   console.log(`Starting C sender: ${senderPath} ${args.join(' ')}`);
@@ -422,7 +433,8 @@ router.post('/start-precision', (req, res) => {
         vlanId,
         tcList,
         packetsPerSecond,
-        duration
+        duration,
+        frameSize
       }
     });
   } catch (err) {

@@ -1,8 +1,8 @@
 /*
- * Precision Traffic Sender for TSN Testing
+ * Precision Traffic Sender for TSN/CBS Testing
  * Compile: gcc -O2 -o traffic-sender traffic-sender.c -lpthread -lrt
- * Run: sudo ./traffic-sender <interface> <dst_mac> <src_mac> <vlan_id> <tc_list> <pps> <duration>
- * Example: sudo ./traffic-sender enx00e04c681336 FA:AE:C9:26:A4:08 00:e0:4c:68:13:36 100 "1,2,3,4,5,6,7" 100 7
+ * Run: ./traffic-sender <interface> <dst_mac> <src_mac> <vlan_id> <tc_list> <pps> <duration> [frame_size]
+ * Example: ./traffic-sender enp11s0 FA:AE:C9:26:A4:08 00:e0:4c:68:13:36 100 "6,7" 5000 10 1000
  */
 
 #define _GNU_SOURCE
@@ -23,15 +23,16 @@
 #include <arpa/inet.h>
 
 #define MAX_TCS 8
-#define FRAME_SIZE 64
-#define PAYLOAD_SIZE 10
+#define MAX_FRAME_SIZE 1518
+#define MIN_FRAME_SIZE 64
 
 // Frame buffer for each TC
-static unsigned char frames[MAX_TCS][FRAME_SIZE];
+static unsigned char frames[MAX_TCS][MAX_FRAME_SIZE];
 static int frame_lens[MAX_TCS];
 
 // Statistics
 static unsigned long tx_counts[MAX_TCS];
+static unsigned long tx_bytes[MAX_TCS];
 static unsigned long total_tx = 0;
 
 // Parse MAC address string to bytes
@@ -56,17 +57,16 @@ unsigned short ip_checksum(unsigned short *buf, int len) {
 
 // Build Ethernet frame with VLAN tag and UDP payload
 int build_frame(unsigned char *frame, unsigned char *dst_mac, unsigned char *src_mac,
-                int vlan_id, int pcp) {
+                int vlan_id, int pcp, int target_frame_size) {
     int offset = 0;
 
-    // Ethernet header
+    // Ethernet header (14 bytes)
     memcpy(frame + offset, dst_mac, 6); offset += 6;
     memcpy(frame + offset, src_mac, 6); offset += 6;
 
-    // 802.1Q VLAN tag
+    // 802.1Q VLAN tag (4 bytes)
     frame[offset++] = 0x81;
     frame[offset++] = 0x00;
-    // TCI: PCP(3) + DEI(1) + VID(12)
     unsigned short tci = ((pcp & 0x7) << 13) | (vlan_id & 0xFFF);
     frame[offset++] = (tci >> 8) & 0xFF;
     frame[offset++] = tci & 0xFF;
@@ -75,12 +75,19 @@ int build_frame(unsigned char *frame, unsigned char *dst_mac, unsigned char *src
     frame[offset++] = 0x08;
     frame[offset++] = 0x00;
 
+    // Calculate payload size to reach target frame size
+    // Header: 6+6+4+2 = 18 bytes Ethernet+VLAN
+    // IP header: 20 bytes, UDP header: 8 bytes
+    int payload_size = target_frame_size - 18 - 20 - 8;
+    if (payload_size < 10) payload_size = 10;
+    if (payload_size > 1472) payload_size = 1472;  // MTU limit
+
     // IP header (20 bytes)
     int ip_start = offset;
     frame[offset++] = 0x45;  // Version + IHL
     frame[offset++] = pcp << 5;  // DSCP = PCP, ECN = 0
 
-    int ip_total_len = 20 + 8 + PAYLOAD_SIZE;  // IP + UDP + payload
+    int ip_total_len = 20 + 8 + payload_size;
     frame[offset++] = (ip_total_len >> 8) & 0xFF;
     frame[offset++] = ip_total_len & 0xFF;
 
@@ -108,19 +115,17 @@ int build_frame(unsigned char *frame, unsigned char *dst_mac, unsigned char *src
     frame[offset++] = (dst_port >> 8) & 0xFF;
     frame[offset++] = dst_port & 0xFF;
 
-    int udp_len = 8 + PAYLOAD_SIZE;
+    int udp_len = 8 + payload_size;
     frame[offset++] = (udp_len >> 8) & 0xFF;
     frame[offset++] = udp_len & 0xFF;
-    frame[offset++] = 0x00; frame[offset++] = 0x00;  // Checksum (optional for IPv4)
+    frame[offset++] = 0x00; frame[offset++] = 0x00;  // Checksum (optional)
 
-    // Payload
-    for (int i = 0; i < PAYLOAD_SIZE; i++) {
-        frame[offset++] = i & 0xFF;
-    }
-
-    // Pad to minimum 60 bytes (64 with FCS, but we don't add FCS)
-    while (offset < 60) {
-        frame[offset++] = 0x00;
+    // Payload with TC marker
+    frame[offset++] = 'T';
+    frame[offset++] = 'C';
+    frame[offset++] = '0' + pcp;
+    for (int i = 3; i < payload_size; i++) {
+        frame[offset++] = (i + pcp) & 0xFF;
     }
 
     return offset;
@@ -140,7 +145,7 @@ static inline void wait_until(unsigned long target_ns) {
     }
 }
 
-// Parse TC list string like "1,2,3,4,5,6,7"
+// Parse TC list string like "6,7"
 int parse_tc_list(const char *str, int *tcs) {
     int count = 0;
     char *copy = strdup(str);
@@ -155,8 +160,9 @@ int parse_tc_list(const char *str, int *tcs) {
 
 int main(int argc, char *argv[]) {
     if (argc < 8) {
-        fprintf(stderr, "Usage: %s <interface> <dst_mac> <src_mac> <vlan_id> <tc_list> <pps> <duration>\n", argv[0]);
-        fprintf(stderr, "Example: %s enx00e04c681336 FA:AE:C9:26:A4:08 00:e0:4c:68:13:36 100 \"1,2,3,4,5,6,7\" 100 7\n", argv[0]);
+        fprintf(stderr, "Usage: %s <iface> <dst_mac> <src_mac> <vlan> <tc_list> <pps> <duration> [frame_size]\n", argv[0]);
+        fprintf(stderr, "Example: %s enp11s0 FA:AE:C9:26:A4:08 00:e0:4c:68:13:36 100 \"6,7\" 5000 10 1000\n", argv[0]);
+        fprintf(stderr, "\nFrame size default: 1000 bytes (gives ~8Mbps at 1000 pps per TC)\n");
         return 1;
     }
 
@@ -167,6 +173,10 @@ int main(int argc, char *argv[]) {
     const char *tc_list_str = argv[5];
     int pps = atoi(argv[6]);
     int duration = atoi(argv[7]);
+    int frame_size = argc > 8 ? atoi(argv[8]) : 1000;  // Default 1000 bytes
+
+    if (frame_size < MIN_FRAME_SIZE) frame_size = MIN_FRAME_SIZE;
+    if (frame_size > MAX_FRAME_SIZE) frame_size = MAX_FRAME_SIZE;
 
     unsigned char dst_mac[6], src_mac[6];
     if (parse_mac(dst_mac_str, dst_mac) < 0 || parse_mac(src_mac_str, src_mac) < 0) {
@@ -181,17 +191,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Set real-time scheduling
+    // Set real-time scheduling (may fail without root)
     struct sched_param param;
     param.sched_priority = sched_get_priority_max(SCHED_FIFO);
     if (sched_setscheduler(0, SCHED_FIFO, &param) < 0) {
-        fprintf(stderr, "Warning: Failed to set SCHED_FIFO (run as root): %s\n", strerror(errno));
+        // Not critical, continue anyway
     }
 
     // Lock memory
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0) {
-        fprintf(stderr, "Warning: mlockall failed: %s\n", strerror(errno));
-    }
+    mlockall(MCL_CURRENT | MCL_FUTURE);
 
     // Create raw socket
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -224,18 +232,33 @@ int main(int argc, char *argv[]) {
 
     // Pre-build frames for each TC
     for (int i = 0; i < num_tcs; i++) {
-        frame_lens[tcs[i]] = build_frame(frames[tcs[i]], dst_mac, src_mac, vlan_id, tcs[i]);
+        frame_lens[tcs[i]] = build_frame(frames[tcs[i]], dst_mac, src_mac, vlan_id, tcs[i], frame_size);
     }
 
-    // Calculate interval
+    // Calculate interval (PPS is total, divided among TCs)
+    // For CBS testing, we want high rate PER TC
     unsigned long interval_ns = 1000000000UL / pps;
     unsigned long duration_ns = (unsigned long)duration * 1000000000UL;
 
-    fprintf(stderr, "Starting traffic: %d TCs, %d PPS, %d sec, interval=%lu ns\n",
-            num_tcs, pps, duration, interval_ns);
+    // Calculate expected bandwidth per TC
+    double bits_per_frame = frame_size * 8.0;
+    double pps_per_tc = (double)pps / num_tcs;
+    double mbps_per_tc = (pps_per_tc * bits_per_frame) / 1000000.0;
+
+    fprintf(stderr, "=== CBS Traffic Test ===\n");
+    fprintf(stderr, "Interface: %s\n", ifname);
+    fprintf(stderr, "TCs: ");
+    for (int i = 0; i < num_tcs; i++) fprintf(stderr, "%d ", tcs[i]);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Frame size: %d bytes\n", frame_size);
+    fprintf(stderr, "Total PPS: %d (%.1f pps/TC)\n", pps, pps_per_tc);
+    fprintf(stderr, "Expected BW/TC: %.2f Mbps\n", mbps_per_tc);
+    fprintf(stderr, "Duration: %d sec\n", duration);
+    fprintf(stderr, "========================\n");
 
     // Initialize stats
     memset(tx_counts, 0, sizeof(tx_counts));
+    memset(tx_bytes, 0, sizeof(tx_bytes));
     total_tx = 0;
 
     unsigned long start_time = get_time_ns();
@@ -243,14 +266,13 @@ int main(int argc, char *argv[]) {
     int tc_idx = 0;
 
     while (get_time_ns() - start_time < duration_ns) {
-        // Wait for next send time
         wait_until(next_send);
 
-        // Send packet
         int tc = tcs[tc_idx % num_tcs];
         ssize_t sent = send(sock, frames[tc], frame_lens[tc], 0);
         if (sent > 0) {
             tx_counts[tc]++;
+            tx_bytes[tc] += sent;
             total_tx++;
         }
 
@@ -258,23 +280,37 @@ int main(int argc, char *argv[]) {
         next_send += interval_ns;
     }
 
+    close(sock);
+
     unsigned long end_time = get_time_ns();
     double actual_duration = (end_time - start_time) / 1e9;
     double actual_pps = total_tx / actual_duration;
 
-    // Print JSON result
-    printf("{\"success\":true,\"sent\":{");
+    // Print results to stderr
+    fprintf(stderr, "\n=== Results ===\n");
+    fprintf(stderr, "Duration: %.2f sec\n", actual_duration);
+    fprintf(stderr, "Total packets: %lu (%.1f pps)\n", total_tx, actual_pps);
+    for (int i = 0; i < MAX_TCS; i++) {
+        if (tx_counts[i] > 0) {
+            double tc_pps = tx_counts[i] / actual_duration;
+            double tc_mbps = (tx_bytes[i] * 8.0) / (actual_duration * 1000000.0);
+            fprintf(stderr, "TC%d: %lu pkts (%.1f pps, %.2f Mbps)\n", i, tx_counts[i], tc_pps, tc_mbps);
+        }
+    }
+
+    // Print JSON result to stdout
+    printf("{\"success\":true,\"duration\":%.2f,\"total\":%lu,\"pps\":%.1f,\"sent\":{",
+           actual_duration, total_tx, actual_pps);
     int first = 1;
     for (int i = 0; i < MAX_TCS; i++) {
         if (tx_counts[i] > 0) {
+            double tc_mbps = (tx_bytes[i] * 8.0) / (actual_duration * 1000000.0);
             if (!first) printf(",");
-            printf("\"%d\":%lu", i, tx_counts[i]);
+            printf("\"%d\":{\"packets\":%lu,\"bytes\":%lu,\"mbps\":%.2f}", i, tx_counts[i], tx_bytes[i], tc_mbps);
             first = 0;
         }
     }
-    printf("},\"total\":%lu,\"duration\":%.3f,\"actual_pps\":%.1f}\n",
-           total_tx, actual_duration, actual_pps);
+    printf("}}\n");
 
-    close(sock);
     return 0;
 }

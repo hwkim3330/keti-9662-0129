@@ -56,11 +56,51 @@ export const api = {
 
   // ========== Traffic ==========
   traffic: {
-    start: (iface, options = {}) => api.post('/api/traffic/start-precision', {
-      interface: iface,
-      ...options
-    }),
-    stop: () => api.post('/api/traffic/stop-precision'),
+    // Start traffic generator (tries C precision first, falls back to JS)
+    start: async (iface, options = {}) => {
+      // Try C precision sender first
+      try {
+        const result = await api.post('/api/traffic/start-precision', {
+          interface: iface,
+          ...options
+        });
+        return result;
+      } catch (e) {
+        // Fallback to JS sender with multi-TC support
+        console.warn('[Traffic] C sender failed, using JS sender:', e.message);
+        return api.traffic.startJS(iface, options);
+      }
+    },
+    // JS-based multi-TC traffic generator
+    startJS: async (iface, options = {}) => {
+      const { tcList = [0], dstMac, vlanId = 100, packetsPerSecond = 1000, duration = 10, frameSize = 1000 } = options;
+      const ppsPerTC = Math.floor(packetsPerSecond / tcList.length);
+      const results = [];
+
+      for (const tc of tcList) {
+        try {
+          const result = await api.post('/api/traffic/start', {
+            interface: iface,
+            dstMac,
+            vlanId,
+            pcp: tc,
+            packetSize: frameSize,
+            packetsPerSecond: ppsPerTC,
+            duration
+          });
+          results.push({ tc, ...result });
+        } catch (e) {
+          results.push({ tc, error: e.message });
+        }
+      }
+      return { success: true, generators: results };
+    },
+    stop: async () => {
+      // Stop both C and JS generators
+      try { await api.post('/api/traffic/stop-precision'); } catch {}
+      try { await api.post('/api/traffic/stop'); } catch {}
+      return { success: true };
+    },
     status: () => api.get('/api/traffic/status'),
     getInterfaces: () => api.get('/api/traffic/interfaces')
   },

@@ -109,12 +109,12 @@ export function render(appState) {
             <select id="rx-iface" class="input input-sm"></select>
           </div>
           <div class="input-group">
-            <label>PPS</label>
-            <input type="number" id="pps" value="200" class="input input-sm" style="width:70px">
+            <label>PPS (Total)</label>
+            <input type="number" id="pps" value="4000" class="input input-sm" style="width:80px">
           </div>
           <div class="input-group">
             <label>Duration</label>
-            <input type="number" id="duration" value="8" class="input input-sm" style="width:60px">
+            <input type="number" id="duration" value="10" class="input input-sm" style="width:60px">
           </div>
         </div>
       </div>
@@ -802,8 +802,8 @@ function applyEstimateToConfig() {
 async function startTest() {
   const txIface = document.getElementById('tx-iface')?.value;
   const rxIface = document.getElementById('rx-iface')?.value;
-  const pps = parseInt(document.getElementById('pps')?.value) || 200;
-  const duration = parseInt(document.getElementById('duration')?.value) || 8;
+  const pps = parseInt(document.getElementById('pps')?.value) || 2000;  // Higher default PPS
+  const duration = parseInt(document.getElementById('duration')?.value) || 10;
 
   if (!txIface || !rxIface) return alert('Select interfaces');
   if (selectedTCs.length === 0) return alert('Select at least one TC');
@@ -825,21 +825,36 @@ async function startTest() {
   updateUI();
   updatePacketTables();
 
-  // Use TC-specific idle slopes (different BW% per TC)
-  // TC별로 다른 대역폭 할당 - 높은 TC = 높은 대역폭
-  const packetSizeBytes = 1500;
-  const bwPercentPerTC = [5, 7, 10, 12, 15, 17, 20, 25];  // TC0=5%, TC7=25%
+  // CBS 테스트용 설정
+  // 프레임 크기 1000바이트 = 8000비트
+  // 1000 pps/TC → 8 Mbps/TC
+  // 2000 pps/TC → 16 Mbps/TC
+  const frameSize = 1000;  // bytes
+  const bitsPerFrame = frameSize * 8;
+  const ppsPerTC = Math.floor(pps / selectedTCs.length);
+  const expectedMbpsPerTC = (ppsPerTC * bitsPerFrame) / 1000000;
+
+  // CBS 한도를 보낸 트래픽의 50-80%로 설정 (shaping 효과 확인용)
+  // TC별로 다른 한도 설정
+  const cbsLimitRatios = [0.3, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8];
 
   selectedTCs.forEach(tc => {
-    const bwPercent = bwPercentPerTC[tc];
-    const idleSlope = (bwPercent / 100) * linkSpeedMbps * 1000000;
+    const limitRatio = cbsLimitRatios[tc];
+    const targetMbps = expectedMbpsPerTC * limitRatio;
+    const idleSlope = targetMbps * 1000000;  // bps
+    const bwPercent = (idleSlope / (linkSpeedMbps * 1000000)) * 100;
+
     cbsConfig[tc] = {
       enabled: true,
       idleSlope: idleSlope,
       bandwidthPercent: bwPercent,
+      expectedTxMbps: expectedMbpsPerTC,
       estimated: false
     };
   });
+
+  console.log(`[CBS Test] PPS=${pps}, PPS/TC=${ppsPerTC}, Expected TX=${expectedMbpsPerTC.toFixed(1)} Mbps/TC`);
+  console.log(`[CBS Test] Frame size=${frameSize}B, Selected TCs:`, selectedTCs);
 
   // Update config UI
   document.getElementById('cbs-config-rows').innerHTML =
@@ -849,7 +864,6 @@ async function startTest() {
   // Start TX tracking timer
   let elapsed = 0;
   const interval = 200;
-  const ppsPerTC = pps;
   const pktsPerIntervalPerTC = ppsPerTC * (interval / 1000);
 
   const txTimer = setInterval(() => {
@@ -867,7 +881,8 @@ async function startTest() {
       txEntry.tc[tc] = packetsToSend;
 
       if (!txTcStats[tc]) {
-        txTcStats[tc] = { count: 0, pps: ppsPerTC, bwPercent: cfg.bandwidthPercent };
+        const txMbps = (ppsPerTC * bitsPerFrame) / 1000000;
+        txTcStats[tc] = { count: 0, pps: ppsPerTC, bwPercent: cfg.bandwidthPercent, txMbps };
       }
       txTcStats[tc].count += packetsToSend;
     });
@@ -888,8 +903,9 @@ async function startTest() {
       dstMac,
       vlanId: 100,
       tcList: selectedTCs,
-      packetsPerSecond: pps * selectedTCs.length,
-      duration
+      packetsPerSecond: pps,  // Total PPS (divided among TCs by C sender)
+      duration,
+      frameSize
     });
 
     // Schedule automatic estimation after traffic completes

@@ -159,12 +159,15 @@ router.get('/status/:port', async (req, res) => {
 
 /**
  * POST /api/cbs/configure/:port
- * Configure CBS for a specific port
+ * Configure CBS or Single Leaky Bucket shaper for a specific port
  *
  * Body:
  * {
  *   tc: number (0-7),
- *   idleSlope: number (bits/sec) - will be converted to kbps for device,
+ *   idleSlope: number (bits/sec) - for CBS mode,
+ *   cir: number (bits/sec) - for Single Leaky Bucket mode,
+ *   cbs: number (bytes) - burst size for SLB mode,
+ *   mode: 'cbs' | 'slb' - shaper mode (default: 'cbs'),
  *   linkSpeed?: number (Mbps, default 100),
  *   transport?: 'serial' | 'wifi',
  *   device?: string
@@ -174,7 +177,10 @@ router.post('/configure/:port', async (req, res) => {
   const portNum = req.params.port;
   const {
     tc,
-    idleSlope,  // Input in bps for API consistency
+    idleSlope,  // For CBS mode (bps)
+    cir,        // For SLB mode (bps)
+    cbs: burstSize,  // For SLB mode (bytes)
+    mode = 'cbs',
     linkSpeed = DEFAULT_LINK_SPEED_MBPS,
     transport,
     device,
@@ -186,13 +192,24 @@ router.post('/configure/:port', async (req, res) => {
     return res.status(400).json({ error: 'tc must be 0-7' });
   }
 
-  if (!idleSlope || idleSlope <= 0) {
-    return res.status(400).json({ error: 'idleSlope (bps) is required and must be positive' });
+  const linkSpeedBps = linkSpeed * 1000000;
+  const useSLB = mode === 'slb' || cir !== undefined;
+
+  // Validate parameters based on mode
+  if (useSLB) {
+    if (!cir || cir <= 0) {
+      return res.status(400).json({ error: 'cir (bps) is required for SLB mode' });
+    }
+  } else {
+    if (!idleSlope || idleSlope <= 0) {
+      return res.status(400).json({ error: 'idleSlope (bps) is required for CBS mode' });
+    }
   }
 
   // Convert bps to kbps for device (LAN9662 uses kbps)
-  const idleSlopeKbps = Math.round(idleSlope / 1000);
-  const linkSpeedBps = linkSpeed * 1000000;
+  const idleSlopeKbps = idleSlope ? Math.round(idleSlope / 1000) : 0;
+  const cirKbps = cir ? Math.round(cir / 1000) : 0;
+  const cbsBytes = burstSize || 16000;  // Default 16KB burst
 
   try {
     const yangCacheDir = await findYangCache();
@@ -203,18 +220,34 @@ router.post('/configure/:port', async (req, res) => {
     const decoder = new Cbor2TscConverter(yangCacheDir);
     const transportInstance = await createConnection({ transport, device, host, port });
 
-    // Build CBS configuration using Microchip YANG model
-    // Create full list entry with traffic-class key and credit-based container
-    const cbsPath = buildCbsPath(portNum);
+    // Build shaper configuration using Microchip YANG model
+    const shaperPath = buildCbsPath(portNum);
 
-    const cbsConfig = {
-      [cbsPath]: {
-        'traffic-class': tc,
-        'credit-based': {
-          'idle-slope': idleSlopeKbps
+    let shaperConfig;
+    if (useSLB) {
+      // Single Leaky Bucket mode
+      shaperConfig = {
+        [shaperPath]: {
+          'traffic-class': tc,
+          'single-leaky-bucket': {
+            'committed-information-rate': cirKbps,
+            'committed-burst-size': cbsBytes
+          }
         }
-      }
-    };
+      };
+    } else {
+      // Credit-Based Shaper mode
+      shaperConfig = {
+        [shaperPath]: {
+          'traffic-class': tc,
+          'credit-based': {
+            'idle-slope': idleSlopeKbps
+          }
+        }
+      };
+    }
+
+    const cbsConfig = shaperConfig;
 
     const configYaml = yaml.dump([cbsConfig]);
     console.log('CBS Config YAML:', configYaml);
@@ -240,13 +273,16 @@ router.post('/configure/:port', async (req, res) => {
       return res.status(500).json({ error: errorDetail });
     }
 
+    const rateKbps = useSLB ? cirKbps : idleSlopeKbps;
     res.json({
       success: true,
       port: portNum,
       tc,
-      idleSlopeKbps,
-      idleSlopeBps: idleSlopeKbps * 1000,
-      bandwidthPercent: (idleSlopeKbps * 1000 / linkSpeedBps) * 100
+      mode: useSLB ? 'slb' : 'cbs',
+      rateKbps,
+      rateBps: rateKbps * 1000,
+      bandwidthPercent: (rateKbps * 1000 / linkSpeedBps) * 100,
+      ...(useSLB ? { cirKbps, cbsBytes } : { idleSlopeKbps })
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
