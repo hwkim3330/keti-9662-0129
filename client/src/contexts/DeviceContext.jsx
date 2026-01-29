@@ -4,12 +4,10 @@ const DeviceContext = createContext()
 
 const STORAGE_KEY = 'tsn-devices'
 const STORAGE_VERSION_KEY = 'tsn-devices-version'
-const DEVICES_VERSION = 10  // Added board3 for ttyACM2
+const DEVICES_VERSION = 11  // Single LAN9662 board
 
 const defaultDevices = [
-  { id: 'board1', name: 'LAN9692 #1', transport: 'serial', device: '/dev/ttyACM0' },
-  { id: 'board2', name: 'LAN9692 #2', transport: 'serial', device: '/dev/ttyACM1' },
-  { id: 'board3', name: 'LAN9692 #3', transport: 'serial', device: '/dev/ttyACM2' },
+  { id: 'board1', name: 'LAN9662', transport: 'serial', device: '/dev/ttyACM0' },
 ]
 
 export function DeviceProvider({ children }) {
