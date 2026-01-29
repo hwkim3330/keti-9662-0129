@@ -181,7 +181,11 @@ export function getCaptureState() {
     running: captures.size > 0,
     activeCaptures: active,
     totalInterfaces: captures.size,
-    globalPacketCount
+    globalPacketCount,
+    cCapture: cCaptureProcess ? {
+      running: true,
+      stats: cCaptureStats
+    } : { running: false }
   };
 }
 
@@ -689,16 +693,39 @@ router.post('/start-c', (req, res) => {
 });
 
 // Stop C capture
-router.post('/stop-c', (req, res) => {
+router.post('/stop-c', async (req, res) => {
   if (!cCaptureProcess) {
     return res.json({ success: true, message: 'No C capture running' });
   }
 
   try {
+    const proc = cCaptureProcess;
+
+    // Create promise to wait for process to exit
+    const waitForExit = new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        if (cCaptureProcess === proc) {
+          try { proc.kill('SIGKILL'); } catch {}
+          cCaptureProcess = null;
+        }
+        resolve();
+      }, 1000);
+
+      proc.once('close', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+
     // Send SIGTERM to gracefully stop
-    cCaptureProcess.kill('SIGTERM');
+    proc.kill('SIGTERM');
+
+    // Wait up to 1 second for graceful shutdown
+    await waitForExit;
+
     res.json({ success: true, message: 'C capture stopped', stats: cCaptureStats });
   } catch (err) {
+    cCaptureProcess = null;
     res.status(500).json({ error: err.message });
   }
 });
