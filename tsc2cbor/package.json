@@ -1,0 +1,45 @@
+{
+  "name": "tsc2cbor",
+  "version": "1.0.0",
+  "description": "TSN Switch Configuration to CBOR converter with RFC 9254 Delta-SID encoding",
+  "main": "tsc2cbor.js",
+  "type": "module",
+  "scripts": {
+    "test": "node test/test.js",
+    "test:parsers": "node test/test-parsers.js",
+    "test:all-parsers": "node test/test-all-parsers.js",
+    "test:encoding": "node test/test-value-encoding.js",
+    "test:transformation": "node test/test-transformation.js",
+    "test:cbor": "node test/test-cbor-encoding.js",
+    "test:yaml": "node test/test-yaml-loader.js",
+    "test:all": "npm run test:yaml && npm run test:all-parsers && npm run test:encoding && npm run test:transformation && npm run test:cbor",
+    "convert": "node tsc2cbor.js",
+    "validate": "node tsc2cbor.js --validate"
+  },
+  "keywords": [
+    "CBOR",
+    "YANG",
+    "TSN",
+    "RFC9254",
+    "CoAP",
+    "Delta-SID",
+    "CORECONF",
+    "IEEE802.1",
+    "switch-configuration"
+  ],
+  "author": "KETI TSN Team",
+  "license": "MIT",
+  "dependencies": {
+    "cbor": "^9.0.0",
+    "cbor-x": "^1.6.0",
+    "js-yaml": "^4.1.0",
+    "xml2js": "^0.6.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/tsc2cbor.git"
+  }
+}

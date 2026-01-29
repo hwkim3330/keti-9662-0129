@@ -1,0 +1,326 @@
+#!/bin/bash
+#
+# TSN Configuration Verification Tool
+# Unified CLI for CBS/TAS testing on LAN9662
+#
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Auto-detect USB NICs
+detect_interfaces() {
+    local nics=($(ip link show | grep -E "^[0-9]+: enx" | sed 's/.*: \(enx[^:@]*\).*/\1/' | head -2))
+    if [ ${#nics[@]} -ge 2 ]; then
+        TX_IF="${nics[0]}"
+        RX_IF="${nics[1]}"
+        return 0
+    fi
+    return 1
+}
+
+# Show help
+show_help() {
+    cat << EOF
+TSN Configuration Verification Tool
+
+Usage: $0 <command> [options]
+
+Commands:
+  verify     Run traffic verification test (CBS/TAS detection)
+  cbs        Estimate CBS idle slope configuration
+  tas        Estimate TAS GCL configuration
+  quick      Quick connectivity test
+  send       Send test traffic only
+  capture    Capture and analyze traffic only
+  status     Check board and interface status
+
+Options:
+  --tx-if <if>       TX interface (default: auto-detect)
+  --rx-if <if>       RX interface (default: auto-detect)
+  --vlan <id>        VLAN ID (default: 100, 0 = untagged)
+  --duration <sec>   Test duration (default: 10)
+  --pps <rate>       Packets per second (default: 1000)
+  --tc <list>        TC list (default: 0,1,2,3,4,5,6,7)
+  --json             Output JSON format
+
+Examples:
+  $0 verify                          # Quick CBS/TAS verification
+  $0 cbs --duration 15               # CBS estimation (15 seconds)
+  $0 tas --vlan 100 --duration 20    # TAS estimation with VLAN
+  $0 quick                           # Connectivity test
+
+EOF
+}
+
+# Check prerequisites
+check_prereqs() {
+    # Check if binaries exist
+    for tool in traffic-sender traffic-capture cbs-estimator tas-estimator tsn-verify-simple; do
+        if [ ! -x "$SCRIPT_DIR/$tool" ]; then
+            echo -e "${YELLOW}Building tools...${NC}"
+            make -C "$SCRIPT_DIR" all
+            break
+        fi
+    done
+
+    # Check interfaces
+    if ! detect_interfaces; then
+        echo -e "${RED}Error: Could not detect USB NICs${NC}"
+        echo "Available interfaces:"
+        ip link show | grep -E "^[0-9]+:" | sed 's/.*: \([^:@]*\).*/  \1/'
+        exit 1
+    fi
+
+    echo -e "${GREEN}Detected interfaces:${NC}"
+    echo "  TX: $TX_IF"
+    echo "  RX: $RX_IF"
+}
+
+# Quick connectivity test
+cmd_quick() {
+    check_prereqs
+    echo ""
+    echo -e "${BLUE}Running connectivity test...${NC}"
+    sudo "$SCRIPT_DIR/quick-test" "$TX_IF" "$RX_IF" 3
+}
+
+# CBS estimation
+cmd_cbs() {
+    check_prereqs
+    local duration=${DURATION:-10}
+    local vlan=${VLAN:-100}
+
+    echo ""
+    echo -e "${BLUE}CBS Idle Slope Estimation${NC}"
+    echo "  Duration: ${duration}s"
+    echo "  VLAN: $vlan"
+    echo ""
+
+    # Start capture in background
+    sudo "$SCRIPT_DIR/cbs-estimator" "$RX_IF" "$duration" "$vlan" 100 &
+    local capture_pid=$!
+
+    # Wait a moment then start sending
+    sleep 0.5
+
+    # Send traffic
+    echo "Sending test traffic..."
+    local tx_mac=$(ip link show "$TX_IF" | grep ether | awk '{print $2}')
+    local rx_mac=$(ip link show "$RX_IF" | grep ether | awk '{print $2}')
+
+    sudo "$SCRIPT_DIR/traffic-sender" "$TX_IF" "$rx_mac" "$tx_mac" "$vlan" "0,1,2,3,4,5,6,7" 1000 "$duration" &
+    local sender_pid=$!
+
+    wait $capture_pid 2>/dev/null || true
+    wait $sender_pid 2>/dev/null || true
+}
+
+# TAS estimation
+cmd_tas() {
+    check_prereqs
+    local duration=${DURATION:-10}
+    local vlan=${VLAN:-100}
+    local cycle=${CYCLE:-0}
+
+    echo ""
+    echo -e "${BLUE}TAS GCL Estimation${NC}"
+    echo "  Duration: ${duration}s"
+    echo "  VLAN: $vlan"
+    if [ "$cycle" != "0" ]; then
+        echo "  Expected Cycle: ${cycle}ms"
+    fi
+    echo ""
+
+    # Start capture in background
+    sudo "$SCRIPT_DIR/tas-estimator" "$RX_IF" "$duration" "$vlan" "$cycle" &
+    local capture_pid=$!
+
+    sleep 0.5
+
+    echo "Sending test traffic..."
+    local tx_mac=$(ip link show "$TX_IF" | grep ether | awk '{print $2}')
+    local rx_mac=$(ip link show "$RX_IF" | grep ether | awk '{print $2}')
+
+    sudo "$SCRIPT_DIR/traffic-sender" "$TX_IF" "$rx_mac" "$tx_mac" "$vlan" "0,1,2,3,4,5,6,7" 1000 "$duration" &
+    local sender_pid=$!
+
+    wait $capture_pid 2>/dev/null || true
+    wait $sender_pid 2>/dev/null || true
+}
+
+# Full verification
+cmd_verify() {
+    check_prereqs
+    local duration=${DURATION:-10}
+    local vlan=${VLAN:-100}
+
+    echo ""
+    echo -e "${BLUE}TSN Configuration Verification${NC}"
+    echo ""
+
+    if [ "$vlan" = "0" ]; then
+        sudo "$SCRIPT_DIR/tsn-verify-simple" "$TX_IF" "$RX_IF" "$duration" "${PPS:-1000}"
+    else
+        sudo "$SCRIPT_DIR/tsn-verify-simple" "$TX_IF" "$RX_IF" "$duration" "${PPS:-1000}" --vlan "$vlan"
+    fi
+}
+
+# Capture only
+cmd_capture() {
+    check_prereqs
+    local duration=${DURATION:-10}
+    local vlan=${VLAN:-100}
+
+    echo ""
+    echo -e "${BLUE}Traffic Capture${NC}"
+    echo "  Interface: $RX_IF"
+    echo "  Duration: ${duration}s"
+    echo "  VLAN: $vlan"
+    echo ""
+
+    sudo "$SCRIPT_DIR/traffic-capture" "$RX_IF" "$duration" "$vlan" "stats"
+}
+
+# Send only
+cmd_send() {
+    check_prereqs
+    local duration=${DURATION:-10}
+    local vlan=${VLAN:-100}
+    local pps=${PPS:-1000}
+    local tc_list=${TC_LIST:-"0,1,2,3,4,5,6,7"}
+
+    local tx_mac=$(ip link show "$TX_IF" | grep ether | awk '{print $2}')
+    local rx_mac=$(ip link show "$RX_IF" | grep ether | awk '{print $2}')
+
+    echo ""
+    echo -e "${BLUE}Traffic Sender${NC}"
+    echo "  Interface: $TX_IF"
+    echo "  Duration: ${duration}s"
+    echo "  PPS: $pps"
+    echo "  VLAN: $vlan"
+    echo "  TCs: $tc_list"
+    echo ""
+
+    sudo "$SCRIPT_DIR/traffic-sender" "$TX_IF" "$rx_mac" "$tx_mac" "$vlan" "$tc_list" "$pps" "$duration"
+}
+
+# Status check
+cmd_status() {
+    echo ""
+    echo -e "${BLUE}System Status${NC}"
+    echo ""
+
+    # Board
+    echo "Board (ttyACM0):"
+    if [ -e /dev/ttyACM0 ]; then
+        ls -la /dev/ttyACM0
+        echo -e "  ${GREEN}Connected${NC}"
+    else
+        echo -e "  ${RED}Not found${NC}"
+    fi
+    echo ""
+
+    # NICs
+    echo "Network Interfaces:"
+    ip link show | grep -E "^[0-9]+: enx" | while read line; do
+        local iface=$(echo "$line" | sed 's/.*: \(enx[^:@]*\).*/\1/')
+        local state=$(echo "$line" | grep -o "state [A-Z]*" | cut -d' ' -f2)
+        local mac=$(ip link show "$iface" | grep ether | awk '{print $2}')
+        echo "  $iface: $state ($mac)"
+    done
+    echo ""
+}
+
+# Parse arguments
+COMMAND=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        verify|cbs|tas|quick|send|capture|status|help)
+            COMMAND="$1"
+            shift
+            ;;
+        --tx-if)
+            TX_IF="$2"
+            shift 2
+            ;;
+        --rx-if)
+            RX_IF="$2"
+            shift 2
+            ;;
+        --vlan)
+            VLAN="$2"
+            shift 2
+            ;;
+        --duration)
+            DURATION="$2"
+            shift 2
+            ;;
+        --pps)
+            PPS="$2"
+            shift 2
+            ;;
+        --tc)
+            TC_LIST="$2"
+            shift 2
+            ;;
+        --cycle)
+            CYCLE="$2"
+            shift 2
+            ;;
+        --json)
+            JSON_OUTPUT=1
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Execute command
+case "$COMMAND" in
+    verify)
+        cmd_verify
+        ;;
+    cbs)
+        cmd_cbs
+        ;;
+    tas)
+        cmd_tas
+        ;;
+    quick)
+        cmd_quick
+        ;;
+    send)
+        cmd_send
+        ;;
+    capture)
+        cmd_capture
+        ;;
+    status)
+        cmd_status
+        ;;
+    help|"")
+        show_help
+        ;;
+    *)
+        echo "Unknown command: $COMMAND"
+        show_help
+        exit 1
+        ;;
+esac
