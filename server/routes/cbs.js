@@ -2,12 +2,13 @@
  * CBS (Credit-Based Shaper) API Routes
  *
  * IEEE 802.1Qav CBS configuration for LAN9662
+ * Uses Microchip VelocitySP YANG model (mchp-velocitysp-port)
  *
  * CBS Parameters:
- *   - idleSlope: Credit accumulation rate (bits/sec) - determines bandwidth allocation
- *   - sendSlope: Credit consumption rate = -(linkSpeed - idleSlope)
- *   - hiCredit: Maximum credit (bytes)
- *   - loCredit: Minimum credit (bytes, negative)
+ *   - idleSlope: Credit accumulation rate (kilobits/sec) - determines bandwidth allocation
+ *
+ * YANG Path:
+ *   /ietf-interfaces:interfaces/interface[name='X']/mchp-velocitysp-port:eth-qos/config/traffic-class-shapers[traffic-class=Y]/credit-based/idle-slope
  */
 
 import express from 'express';
@@ -58,6 +59,13 @@ async function createConnection(options = {}) {
 }
 
 /**
+ * Build CBS YANG path for Microchip VelocitySP
+ */
+function buildCbsPath(portNum) {
+  return `/ietf-interfaces:interfaces/interface[name='${portNum}']/mchp-velocitysp-port:eth-qos/config/traffic-class-shapers`;
+}
+
+/**
  * GET /api/cbs/status/:port
  * Get CBS status for a specific port
  */
@@ -74,8 +82,8 @@ router.get('/status/:port', async (req, res) => {
     const { sidInfo } = await loadYangInputs(yangCacheDir, false);
     const transportInstance = await createConnection({ transport, device, host, port });
 
-    // Query CBS traffic-class-bandwidth-table
-    const queryPath = `/ietf-interfaces:interfaces/interface[name='${portNum}']/ieee802-dot1q-bridge:bridge-port/ieee802-dot1q-stream-filters-gates:stream-filters/ieee802-dot1q-sched-bridge:traffic-class-bandwidth-table`;
+    // Query CBS traffic-class-shapers using Microchip YANG model
+    const queryPath = buildCbsPath(portNum);
     const queries = extractSidsFromInstanceIdentifier(
       [{ [queryPath]: null }],
       sidInfo,
@@ -97,10 +105,52 @@ router.get('/status/:port', async (req, res) => {
 
     const cbsData = yaml.load(result.yaml);
 
+    // Parse the response to extract TC configurations
+    const tcConfigs = {};
+
+    // Handle different response formats
+    let shapers = [];
+    if (cbsData) {
+      if (cbsData['traffic-class-shapers']) {
+        shapers = cbsData['traffic-class-shapers'];
+      } else if (cbsData['mchp-velocitysp-port:traffic-class-shapers']) {
+        shapers = cbsData['mchp-velocitysp-port:traffic-class-shapers'];
+      } else if (Array.isArray(cbsData)) {
+        // Handle array format from some responses
+        for (const item of cbsData) {
+          const itemShapers = item?.['traffic-class-shapers'] ||
+                             item?.['mchp-velocitysp-port:traffic-class-shapers'] || [];
+          shapers = shapers.concat(itemShapers);
+        }
+      }
+    }
+
+    // Ensure shapers is an array
+    if (!Array.isArray(shapers)) {
+      shapers = shapers ? [shapers] : [];
+    }
+
+    for (const shaper of shapers) {
+      const tc = shaper['traffic-class'];
+      if (shaper['credit-based']) {
+        tcConfigs[tc] = {
+          idleSlopeKbps: shaper['credit-based']['idle-slope'],
+          idleSlopeBps: shaper['credit-based']['idle-slope'] * 1000,
+          bandwidthPercent: (shaper['credit-based']['idle-slope'] * 1000) / (DEFAULT_LINK_SPEED_MBPS * 1000000) * 100
+        };
+      } else if (shaper['single-leaky-bucket']) {
+        tcConfigs[tc] = {
+          type: 'leaky-bucket',
+          cirKbps: shaper['single-leaky-bucket']['committed-information-rate'],
+          cbs: shaper['single-leaky-bucket']['committed-burst-size']
+        };
+      }
+    }
+
     res.json({
       port: portNum,
       raw: result.yaml,
-      config: cbsData
+      tcConfigs
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -114,10 +164,7 @@ router.get('/status/:port', async (req, res) => {
  * Body:
  * {
  *   tc: number (0-7),
- *   idleSlope: number (bits/sec),
- *   sendSlope?: number (auto-calculated if not provided),
- *   hiCredit?: number (bytes),
- *   loCredit?: number (bytes),
+ *   idleSlope: number (bits/sec) - will be converted to kbps for device,
  *   linkSpeed?: number (Mbps, default 100),
  *   transport?: 'serial' | 'wifi',
  *   device?: string
@@ -127,10 +174,7 @@ router.post('/configure/:port', async (req, res) => {
   const portNum = req.params.port;
   const {
     tc,
-    idleSlope,
-    sendSlope,
-    hiCredit,
-    loCredit,
+    idleSlope,  // Input in bps for API consistency
     linkSpeed = DEFAULT_LINK_SPEED_MBPS,
     transport,
     device,
@@ -146,13 +190,9 @@ router.post('/configure/:port', async (req, res) => {
     return res.status(400).json({ error: 'idleSlope (bps) is required and must be positive' });
   }
 
-  // Calculate sendSlope if not provided: sendSlope = -(linkSpeed - idleSlope)
+  // Convert bps to kbps for device (LAN9662 uses kbps)
+  const idleSlopeKbps = Math.round(idleSlope / 1000);
   const linkSpeedBps = linkSpeed * 1000000;
-  const calculatedSendSlope = sendSlope || -(linkSpeedBps - idleSlope);
-
-  // Default hi/lo credit if not provided
-  const calculatedHiCredit = hiCredit || 1600 * 8; // 1 max frame * 8 bits
-  const calculatedLoCredit = loCredit || -calculatedHiCredit;
 
   try {
     const yangCacheDir = await findYangCache();
@@ -163,21 +203,22 @@ router.post('/configure/:port', async (req, res) => {
     const decoder = new Cbor2TscConverter(yangCacheDir);
     const transportInstance = await createConnection({ transport, device, host, port });
 
-    // Build CBS configuration path
-    // IEEE 802.1Qav uses traffic-class-bandwidth-table for CBS
-    const cbsPath = `/ietf-interfaces:interfaces/interface[name='${portNum}']/ieee802-dot1q-bridge:bridge-port/ieee802-dot1q-stream-filters-gates:stream-filters/ieee802-dot1q-sched-bridge:traffic-class-bandwidth-table`;
+    // Build CBS configuration using Microchip YANG model
+    // Create full list entry with traffic-class key and credit-based container
+    const cbsPath = buildCbsPath(portNum);
 
     const cbsConfig = {
       [cbsPath]: {
         'traffic-class': tc,
-        'idle-slope': Math.round(idleSlope),
-        'send-slope': Math.round(calculatedSendSlope),
-        'hi-credit': Math.round(calculatedHiCredit),
-        'lo-credit': Math.round(calculatedLoCredit)
+        'credit-based': {
+          'idle-slope': idleSlopeKbps
+        }
       }
     };
 
     const configYaml = yaml.dump([cbsConfig]);
+    console.log('CBS Config YAML:', configYaml);
+
     const encodeResult = await encoder.convertString(configYaml, { verbose: false });
 
     const response = await transportInstance.sendiPatchRequest(encodeResult.cbor);
@@ -203,11 +244,72 @@ router.post('/configure/:port', async (req, res) => {
       success: true,
       port: portNum,
       tc,
-      idleSlope: Math.round(idleSlope),
-      sendSlope: Math.round(calculatedSendSlope),
-      hiCredit: Math.round(calculatedHiCredit),
-      loCredit: Math.round(calculatedLoCredit),
-      bandwidthPercent: (idleSlope / linkSpeedBps) * 100
+      idleSlopeKbps,
+      idleSlopeBps: idleSlopeKbps * 1000,
+      bandwidthPercent: (idleSlopeKbps * 1000 / linkSpeedBps) * 100
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/cbs/configure/:port/:tc
+ * Remove CBS configuration for a specific TC (disable shaper)
+ */
+router.delete('/configure/:port/:tc', async (req, res) => {
+  const portNum = req.params.port;
+  const tc = parseInt(req.params.tc);
+  const { transport, device, host, port } = req.query;
+
+  if (isNaN(tc) || tc < 0 || tc > 7) {
+    return res.status(400).json({ error: 'tc must be 0-7' });
+  }
+
+  try {
+    const yangCacheDir = await findYangCache();
+    const { Tsc2CborConverter } = await import('../../tsc2cbor/tsc2cbor.js');
+    const { Cbor2TscConverter } = await import('../../tsc2cbor/cbor2tsc.js');
+
+    const encoder = new Tsc2CborConverter(yangCacheDir);
+    const decoder = new Cbor2TscConverter(yangCacheDir);
+    const transportInstance = await createConnection({ transport, device, host, port });
+
+    // Delete the traffic-class-shaper entry
+    const deletePath = `/ietf-interfaces:interfaces/interface[name='${portNum}']/mchp-velocitysp-port:eth-qos/config/traffic-class-shapers[traffic-class=${tc}]`;
+
+    const deleteConfig = {
+      [deletePath]: null  // null indicates deletion
+    };
+
+    const configYaml = yaml.dump([deleteConfig]);
+    const encodeResult = await encoder.convertString(configYaml, { verbose: false, operation: 'delete' });
+
+    // Use DELETE operation
+    const response = await transportInstance.sendiDeleteRequest(encodeResult.cbor);
+    await transportInstance.disconnect();
+
+    if (!response.isSuccess()) {
+      let errorDetail = `CoAP code ${response.code}`;
+      if (response.payload && response.payload.length > 0) {
+        try {
+          const errorResult = await decoder.convertBuffer(response.payload, {
+            verbose: false,
+            outputFormat: 'rfc7951'
+          });
+          errorDetail = errorResult.yaml;
+        } catch {
+          errorDetail = `Payload: ${response.payload.toString('hex')}`;
+        }
+      }
+      return res.status(500).json({ error: errorDetail });
+    }
+
+    res.json({
+      success: true,
+      port: portNum,
+      tc,
+      message: `CBS disabled for TC${tc}`
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -304,7 +406,7 @@ router.get('/ports', async (req, res) => {
 
     for (const portNum of ['1', '2']) {
       try {
-        const queryPath = `/ietf-interfaces:interfaces/interface[name='${portNum}']/ieee802-dot1q-bridge:bridge-port/ieee802-dot1q-stream-filters-gates:stream-filters/ieee802-dot1q-sched-bridge:traffic-class-bandwidth-table`;
+        const queryPath = buildCbsPath(portNum);
         const queries = extractSidsFromInstanceIdentifier(
           [{ [queryPath]: null }],
           sidInfo,
@@ -313,13 +415,47 @@ router.get('/ports', async (req, res) => {
 
         const response = await transportInstance.sendiFetchRequest(queries);
 
-        if (response.isSuccess()) {
+        if (response.isSuccess() && response.payload && response.payload.length > 0) {
           const result = await decoder.convertBuffer(response.payload, {
             verbose: false,
             outputFormat: 'rfc7951'
           });
           const cbsData = yaml.load(result.yaml);
-          results[portNum] = cbsData;
+
+          // Parse TC configurations
+          const tcConfigs = {};
+          let shapers = [];
+
+          if (cbsData) {
+            if (cbsData['traffic-class-shapers']) {
+              shapers = cbsData['traffic-class-shapers'];
+            } else if (cbsData['mchp-velocitysp-port:traffic-class-shapers']) {
+              shapers = cbsData['mchp-velocitysp-port:traffic-class-shapers'];
+            } else if (Array.isArray(cbsData)) {
+              for (const item of cbsData) {
+                const itemShapers = item?.['traffic-class-shapers'] ||
+                                   item?.['mchp-velocitysp-port:traffic-class-shapers'] || [];
+                shapers = shapers.concat(itemShapers);
+              }
+            }
+          }
+
+          if (!Array.isArray(shapers)) {
+            shapers = shapers ? [shapers] : [];
+          }
+
+          for (const shaper of shapers) {
+            const tc = shaper['traffic-class'];
+            if (shaper['credit-based']) {
+              tcConfigs[tc] = {
+                idleSlopeKbps: shaper['credit-based']['idle-slope'],
+                bandwidthPercent: (shaper['credit-based']['idle-slope'] * 1000) / (DEFAULT_LINK_SPEED_MBPS * 1000000) * 100
+              };
+            }
+          }
+          results[portNum] = { tcConfigs, raw: result.yaml };
+        } else {
+          results[portNum] = { tcConfigs: {}, message: 'No CBS configuration' };
         }
       } catch (e) {
         results[portNum] = { error: e.message };
