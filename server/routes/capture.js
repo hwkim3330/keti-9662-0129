@@ -149,15 +149,17 @@ router.post('/start-c', (req, res) => {
   const rxcapPath = path.join(__dirname, '..', 'rxcap');
 
   // Build rxcap arguments
-  // rxcap <interface> --duration <sec> --pcp-stats --seq --latency --csv -
+  // rxcap <interface> --duration <sec> --pcp-stats --seq --seq-only --latency --csv -
   // Note: --csv - outputs CSV to stdout for parsing
+  // --seq-only filters non-txgen packets (noise) using magic byte verification
   const args = [
     iface,
     '--duration', String(duration),
     '--pcp-stats',
     '--seq',
+    '--seq-only',  // Filter noise packets - only count txgen packets with valid header
     '--latency',
-    '--csv', '-'  // Output CSV to stdout for real-time parsing
+    '--csv', '-'   // Output CSV to stdout for real-time parsing
   ];
 
   // Note: rxcap uses --vlan for filtering, but USB NICs strip VLAN tags
