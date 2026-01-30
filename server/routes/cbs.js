@@ -2,7 +2,7 @@
  * CBS (Credit-Based Shaper) API Routes
  *
  * IEEE 802.1Qav CBS configuration for LAN9662
- * Uses Microchip VelocitySP YANG model (mchp-velocitysp-port)
+ * Uses keti-tsn CLI for reliable device communication
  *
  * CBS Parameters:
  *   - idleSlope: Credit accumulation rate (kilobits/sec) - determines bandwidth allocation
@@ -15,47 +15,104 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
-import yaml from 'js-yaml';
+import fs from 'fs';
+import os from 'os';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const TSC2CBOR_LIB = path.resolve(__dirname, '../../tsc2cbor/lib');
-const CBS_ESTIMATOR = path.resolve(__dirname, '../cbs-estimator');
 
 const router = express.Router();
 
-// Default transport settings
-const DEFAULT_DEVICE = '/dev/ttyACM0';
-const DEFAULT_TRANSPORT = 'serial';
-const DEFAULT_LINK_SPEED_MBPS = 100;
+// keti-tsn CLI path
+const KETI_TSN_CLI = '/home/kim/keti-tsn-cli-new/bin/keti-tsn.js';
 
-/**
- * Find YANG cache directory
- */
-async function findYangCache() {
-  const { YangCatalogManager } = await import(`${TSC2CBOR_LIB}/yang-catalog/yang-catalog.js`);
-  const yangCatalog = new YangCatalogManager();
-  const catalogs = yangCatalog.listCachedCatalogs();
-  if (catalogs.length === 0) {
-    throw new Error('No YANG catalog found');
+// Default settings
+const DEFAULT_DEVICE = '/dev/ttyACM0';
+const DEFAULT_LINK_SPEED_MBPS = 1000;  // 1 Gbps (actual link speed)
+
+// Serial port mutex to prevent concurrent access
+let isLocked = false;
+const waitQueue = [];
+
+async function acquireLock() {
+  if (!isLocked) {
+    isLocked = true;
+    return;
   }
-  return catalogs[0].path;
+  return new Promise(resolve => waitQueue.push(resolve));
+}
+
+function releaseLock() {
+  if (waitQueue.length > 0) {
+    const next = waitQueue.shift();
+    next();
+  } else {
+    isLocked = false;
+  }
 }
 
 /**
- * Create transport connection
+ * Execute keti-tsn CLI command with mutex
  */
-async function createConnection(options = {}) {
-  const { createTransport } = await import(`${TSC2CBOR_LIB}/transport/index.js`);
-  const transportType = options.transport || DEFAULT_TRANSPORT;
-  const transport = createTransport(transportType, { verbose: false });
-
-  if (transportType === 'wifi') {
-    await transport.connect({ host: options.host, port: options.port || 5683 });
-  } else {
-    await transport.connect({ device: options.device || DEFAULT_DEVICE });
+async function executeKetiTsn(command, yamlContent, options = {}) {
+  await acquireLock();
+  try {
+    const result = await executeKetiTsnInternal(command, yamlContent, options);
+    await new Promise(r => setTimeout(r, 100)); // Small delay
+    return result;
+  } finally {
+    releaseLock();
   }
-  await transport.waitForReady(5000);
-  return transport;
+}
+
+async function executeKetiTsnInternal(command, yamlContent, options = {}) {
+  return new Promise((resolve, reject) => {
+    // Write YAML to temp file
+    const tmpFile = path.join(os.tmpdir(), `cbs-${Date.now()}.yaml`);
+    fs.writeFileSync(tmpFile, yamlContent, 'utf-8');
+
+    const args = [KETI_TSN_CLI, command, tmpFile];
+    if (options.device) {
+      args.push('-d', options.device);
+    }
+
+    console.log(`[CBS] Running: node ${args.join(' ')}`);
+    console.log(`[CBS] YAML content:\n${yamlContent}`);
+
+    const proc = spawn('node', args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30000
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on('close', (code) => {
+      // Clean up temp file
+      try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
+
+      if (code === 0) {
+        console.log(`[CBS] Success: ${stdout.trim()}`);
+        resolve({ success: true, output: stdout.trim() });
+      } else {
+        console.error(`[CBS] Failed (code ${code}): ${stderr}`);
+        resolve({ success: false, output: stdout, error: stderr || `Exit code ${code}` });
+      }
+    });
+
+    proc.on('error', (err) => {
+      try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
+      console.error(`[CBS] Process error: ${err.message}`);
+      reject(err);
+    });
+  });
 }
 
 /**
@@ -71,85 +128,50 @@ function buildCbsPath(portNum) {
  */
 router.get('/status/:port', async (req, res) => {
   const portNum = req.params.port;
-  const { transport, device, host, port } = req.query;
+  const device = req.query.device || DEFAULT_DEVICE;
 
   try {
-    const yangCacheDir = await findYangCache();
-    const { loadYangInputs } = await import(`${TSC2CBOR_LIB}/common/input-loader.js`);
-    const { extractSidsFromInstanceIdentifier } = await import(`${TSC2CBOR_LIB}/encoder/transformer-instance-id.js`);
-    const { Cbor2TscConverter } = await import('../../tsc2cbor/cbor2tsc.js');
-
-    const { sidInfo } = await loadYangInputs(yangCacheDir, false);
-    const transportInstance = await createConnection({ transport, device, host, port });
-
-    // Query CBS traffic-class-shapers using Microchip YANG model
     const queryPath = buildCbsPath(portNum);
-    const queries = extractSidsFromInstanceIdentifier(
-      [{ [queryPath]: null }],
-      sidInfo,
-      { verbose: false }
-    );
+    const yamlContent = `- ${queryPath}`;
 
-    const response = await transportInstance.sendiFetchRequest(queries);
-    await transportInstance.disconnect();
+    const result = await executeKetiTsn('fetch', yamlContent, { device });
 
-    if (!response.isSuccess()) {
-      return res.status(500).json({ error: `CoAP code ${response.code}` });
+    if (!result.success) {
+      return res.status(500).json({ error: result.error });
     }
 
-    const decoder = new Cbor2TscConverter(yangCacheDir);
-    const result = await decoder.convertBuffer(response.payload, {
-      verbose: false,
-      outputFormat: 'rfc7951'
-    });
-
-    const cbsData = yaml.load(result.yaml);
-
-    // Parse the response to extract TC configurations
+    // Parse YAML output
+    const lines = result.output.split('\n');
     const tcConfigs = {};
+    let currentTc = null;
+    let inCreditBased = false;
 
-    // Handle different response formats
-    let shapers = [];
-    if (cbsData) {
-      if (cbsData['traffic-class-shapers']) {
-        shapers = cbsData['traffic-class-shapers'];
-      } else if (cbsData['mchp-velocitysp-port:traffic-class-shapers']) {
-        shapers = cbsData['mchp-velocitysp-port:traffic-class-shapers'];
-      } else if (Array.isArray(cbsData)) {
-        // Handle array format from some responses
-        for (const item of cbsData) {
-          const itemShapers = item?.['traffic-class-shapers'] ||
-                             item?.['mchp-velocitysp-port:traffic-class-shapers'] || [];
-          shapers = shapers.concat(itemShapers);
-        }
+    for (const line of lines) {
+      const tcMatch = line.match(/traffic-class:\s*(\d+)/);
+      if (tcMatch) {
+        currentTc = parseInt(tcMatch[1]);
+        tcConfigs[currentTc] = {};
       }
-    }
 
-    // Ensure shapers is an array
-    if (!Array.isArray(shapers)) {
-      shapers = shapers ? [shapers] : [];
-    }
+      if (line.includes('credit-based:')) {
+        inCreditBased = true;
+      }
 
-    for (const shaper of shapers) {
-      const tc = shaper['traffic-class'];
-      if (shaper['credit-based']) {
-        tcConfigs[tc] = {
-          idleSlopeKbps: shaper['credit-based']['idle-slope'],
-          idleSlopeBps: shaper['credit-based']['idle-slope'] * 1000,
-          bandwidthPercent: (shaper['credit-based']['idle-slope'] * 1000) / (DEFAULT_LINK_SPEED_MBPS * 1000000) * 100
-        };
-      } else if (shaper['single-leaky-bucket']) {
-        tcConfigs[tc] = {
-          type: 'leaky-bucket',
-          cirKbps: shaper['single-leaky-bucket']['committed-information-rate'],
-          cbs: shaper['single-leaky-bucket']['committed-burst-size']
+      const slopeMatch = line.match(/idle-slope:\s*(\d+)/);
+      if (slopeMatch && currentTc !== null) {
+        const idleSlopeKbps = parseInt(slopeMatch[1]);
+        tcConfigs[currentTc] = {
+          idleSlopeKbps,
+          idleSlopeBps: idleSlopeKbps * 1000,
+          bandwidthPercent: (idleSlopeKbps / (DEFAULT_LINK_SPEED_MBPS * 1000)) * 100
         };
       }
     }
 
     res.json({
       port: portNum,
-      raw: result.yaml,
+      linkSpeedMbps: DEFAULT_LINK_SPEED_MBPS,
+      raw: result.output,
       tcConfigs
     });
   } catch (error) {
@@ -159,130 +181,126 @@ router.get('/status/:port', async (req, res) => {
 
 /**
  * POST /api/cbs/configure/:port
- * Configure CBS or Single Leaky Bucket shaper for a specific port
+ * Configure CBS for a specific port
  *
  * Body:
  * {
  *   tc: number (0-7),
- *   idleSlope: number (bits/sec) - for CBS mode,
- *   cir: number (bits/sec) - for Single Leaky Bucket mode,
- *   cbs: number (bytes) - burst size for SLB mode,
- *   mode: 'cbs' | 'slb' - shaper mode (default: 'cbs'),
- *   linkSpeed?: number (Mbps, default 100),
- *   transport?: 'serial' | 'wifi',
- *   device?: string
+ *   idleSlope: number (kbps) - idle slope in kilobits per second,
+ *   linkSpeed?: number (Mbps, default 1000)
  * }
  */
 router.post('/configure/:port', async (req, res) => {
   const portNum = req.params.port;
   const {
     tc,
-    idleSlope,  // For CBS mode (bps)
-    cir,        // For SLB mode (bps)
-    cbs: burstSize,  // For SLB mode (bytes)
-    mode = 'cbs',
+    idleSlope,  // Now in kbps directly (simplified)
     linkSpeed = DEFAULT_LINK_SPEED_MBPS,
-    transport,
-    device,
-    host,
-    port
+    device
   } = req.body;
 
   if (tc === undefined || tc < 0 || tc > 7) {
     return res.status(400).json({ error: 'tc must be 0-7' });
   }
 
-  const linkSpeedBps = linkSpeed * 1000000;
-  const useSLB = mode === 'slb' || cir !== undefined;
-
-  // Validate parameters based on mode
-  if (useSLB) {
-    if (!cir || cir <= 0) {
-      return res.status(400).json({ error: 'cir (bps) is required for SLB mode' });
-    }
-  } else {
-    if (!idleSlope || idleSlope <= 0) {
-      return res.status(400).json({ error: 'idleSlope (bps) is required for CBS mode' });
-    }
+  if (!idleSlope || idleSlope <= 0) {
+    return res.status(400).json({ error: 'idleSlope (kbps) is required' });
   }
 
-  // Convert bps to kbps for device (LAN9662 uses kbps)
-  const idleSlopeKbps = idleSlope ? Math.round(idleSlope / 1000) : 0;
-  const cirKbps = cir ? Math.round(cir / 1000) : 0;
-  const cbsBytes = burstSize || 16000;  // Default 16KB burst
+  const idleSlopeKbps = Math.round(idleSlope);
+  const bandwidthPercent = (idleSlopeKbps / (linkSpeed * 1000)) * 100;
+
+  console.log(`[CBS] Configure Port ${portNum} TC${tc}: ${idleSlopeKbps} kbps (${bandwidthPercent.toFixed(2)}%)`);
 
   try {
-    const yangCacheDir = await findYangCache();
-    const { Tsc2CborConverter } = await import('../../tsc2cbor/tsc2cbor.js');
-    const { Cbor2TscConverter } = await import('../../tsc2cbor/cbor2tsc.js');
+    // Build YAML for keti-tsn patch
+    const yamlContent = `- ${buildCbsPath(portNum)}:
+    traffic-class: ${tc}
+    credit-based:
+      idle-slope: ${idleSlopeKbps}`;
 
-    const encoder = new Tsc2CborConverter(yangCacheDir);
-    const decoder = new Cbor2TscConverter(yangCacheDir);
-    const transportInstance = await createConnection({ transport, device, host, port });
+    const result = await executeKetiTsn('patch', yamlContent, { device: device || DEFAULT_DEVICE });
 
-    // Build shaper configuration using Microchip YANG model
-    const shaperPath = buildCbsPath(portNum);
-
-    let shaperConfig;
-    if (useSLB) {
-      // Single Leaky Bucket mode
-      shaperConfig = {
-        [shaperPath]: {
-          'traffic-class': tc,
-          'single-leaky-bucket': {
-            'committed-information-rate': cirKbps,
-            'committed-burst-size': cbsBytes
-          }
-        }
-      };
-    } else {
-      // Credit-Based Shaper mode
-      shaperConfig = {
-        [shaperPath]: {
-          'traffic-class': tc,
-          'credit-based': {
-            'idle-slope': idleSlopeKbps
-          }
-        }
-      };
+    if (!result.success) {
+      return res.status(500).json({ error: result.error });
     }
 
-    const cbsConfig = shaperConfig;
-
-    const configYaml = yaml.dump([cbsConfig]);
-    console.log('CBS Config YAML:', configYaml);
-
-    const encodeResult = await encoder.convertString(configYaml, { verbose: false });
-
-    const response = await transportInstance.sendiPatchRequest(encodeResult.cbor);
-    await transportInstance.disconnect();
-
-    if (!response.isSuccess()) {
-      let errorDetail = `CoAP code ${response.code}`;
-      if (response.payload && response.payload.length > 0) {
-        try {
-          const errorResult = await decoder.convertBuffer(response.payload, {
-            verbose: false,
-            outputFormat: 'rfc7951'
-          });
-          errorDetail = errorResult.yaml;
-        } catch {
-          errorDetail = `Payload: ${response.payload.toString('hex')}`;
-        }
-      }
-      return res.status(500).json({ error: errorDetail });
-    }
-
-    const rateKbps = useSLB ? cirKbps : idleSlopeKbps;
     res.json({
       success: true,
       port: portNum,
       tc,
-      mode: useSLB ? 'slb' : 'cbs',
-      rateKbps,
-      rateBps: rateKbps * 1000,
-      bandwidthPercent: (rateKbps * 1000 / linkSpeedBps) * 100,
-      ...(useSLB ? { cirKbps, cbsBytes } : { idleSlopeKbps })
+      idleSlopeKbps,
+      bandwidthPercent,
+      linkSpeedMbps: linkSpeed
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /api/cbs/configure-all/:port
+ * Configure CBS for multiple TCs on a port at once
+ *
+ * Body:
+ * {
+ *   configs: [{ tc: number, idleSlope: number (kbps) }, ...],
+ *   linkSpeed?: number (Mbps, default 1000)
+ * }
+ */
+router.post('/configure-all/:port', async (req, res) => {
+  const portNum = req.params.port;
+  const {
+    configs,
+    linkSpeed = DEFAULT_LINK_SPEED_MBPS,
+    device
+  } = req.body;
+
+  if (!Array.isArray(configs) || configs.length === 0) {
+    return res.status(400).json({ error: 'configs array is required' });
+  }
+
+  try {
+    const results = [];
+
+    // Build YAML with all configs
+    const yamlLines = configs.map(cfg => {
+      if (cfg.tc === undefined || cfg.tc < 0 || cfg.tc > 7) {
+        throw new Error(`Invalid tc: ${cfg.tc}`);
+      }
+      if (!cfg.idleSlope || cfg.idleSlope <= 0) {
+        throw new Error(`Invalid idleSlope for tc ${cfg.tc}`);
+      }
+
+      const idleSlopeKbps = Math.round(cfg.idleSlope);
+      const bandwidthPercent = (idleSlopeKbps / (linkSpeed * 1000)) * 100;
+
+      console.log(`[CBS] Configure Port ${portNum} TC${cfg.tc}: ${idleSlopeKbps} kbps (${bandwidthPercent.toFixed(2)}%)`);
+
+      results.push({
+        tc: cfg.tc,
+        idleSlopeKbps,
+        bandwidthPercent
+      });
+
+      return `- ${buildCbsPath(portNum)}:
+    traffic-class: ${cfg.tc}
+    credit-based:
+      idle-slope: ${idleSlopeKbps}`;
+    });
+
+    const yamlContent = yamlLines.join('\n');
+    const result = await executeKetiTsn('patch', yamlContent, { device: device || DEFAULT_DEVICE });
+
+    if (!result.success) {
+      return res.status(500).json({ error: result.error });
+    }
+
+    res.json({
+      success: true,
+      port: portNum,
+      linkSpeedMbps: linkSpeed,
+      configs: results
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -291,132 +309,39 @@ router.post('/configure/:port', async (req, res) => {
 
 /**
  * DELETE /api/cbs/configure/:port/:tc
- * Remove CBS configuration for a specific TC (disable shaper)
+ * Remove CBS configuration for a specific TC
  */
 router.delete('/configure/:port/:tc', async (req, res) => {
   const portNum = req.params.port;
   const tc = parseInt(req.params.tc);
-  const { transport, device, host, port } = req.query;
+  const device = req.query.device || DEFAULT_DEVICE;
 
   if (isNaN(tc) || tc < 0 || tc > 7) {
     return res.status(400).json({ error: 'tc must be 0-7' });
   }
 
+  console.log(`[CBS] Delete Port ${portNum} TC${tc}`);
+
   try {
-    const yangCacheDir = await findYangCache();
-    const { Tsc2CborConverter } = await import('../../tsc2cbor/tsc2cbor.js');
-    const { Cbor2TscConverter } = await import('../../tsc2cbor/cbor2tsc.js');
+    // To disable CBS for a TC, we set idle-slope to 0 (or remove the entry)
+    // For simplicity, we'll set it to a very high value (effectively unlimited)
+    const yamlContent = `- ${buildCbsPath(portNum)}:
+    traffic-class: ${tc}
+    credit-based:
+      idle-slope: 1000000`;  // 1 Gbps = effectively unlimited
 
-    const encoder = new Tsc2CborConverter(yangCacheDir);
-    const decoder = new Cbor2TscConverter(yangCacheDir);
-    const transportInstance = await createConnection({ transport, device, host, port });
+    const result = await executeKetiTsn('patch', yamlContent, { device });
 
-    // Delete the traffic-class-shaper entry
-    const deletePath = `/ietf-interfaces:interfaces/interface[name='${portNum}']/mchp-velocitysp-port:eth-qos/config/traffic-class-shapers[traffic-class=${tc}]`;
-
-    const deleteConfig = {
-      [deletePath]: null  // null indicates deletion
-    };
-
-    const configYaml = yaml.dump([deleteConfig]);
-    const encodeResult = await encoder.convertString(configYaml, { verbose: false, operation: 'delete' });
-
-    // Use DELETE operation
-    const response = await transportInstance.sendiDeleteRequest(encodeResult.cbor);
-    await transportInstance.disconnect();
-
-    if (!response.isSuccess()) {
-      let errorDetail = `CoAP code ${response.code}`;
-      if (response.payload && response.payload.length > 0) {
-        try {
-          const errorResult = await decoder.convertBuffer(response.payload, {
-            verbose: false,
-            outputFormat: 'rfc7951'
-          });
-          errorDetail = errorResult.yaml;
-        } catch {
-          errorDetail = `Payload: ${response.payload.toString('hex')}`;
-        }
-      }
-      return res.status(500).json({ error: errorDetail });
+    if (!result.success) {
+      return res.status(500).json({ error: result.error });
     }
 
     res.json({
       success: true,
       port: portNum,
       tc,
-      message: `CBS disabled for TC${tc}`
+      message: `CBS disabled for TC${tc} (set to unlimited)`
     });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * POST /api/cbs/estimate
- * Run CBS idle slope estimation on captured traffic
- *
- * Body:
- * {
- *   interface: string,
- *   duration: number (seconds),
- *   vlanId?: number (default 100),
- *   linkSpeed?: number (Mbps, default 100)
- * }
- */
-router.post('/estimate', async (req, res) => {
-  const {
-    interface: ifaceName,
-    duration = 5,
-    vlanId = 100,
-    linkSpeed = DEFAULT_LINK_SPEED_MBPS
-  } = req.body;
-
-  if (!ifaceName) {
-    return res.status(400).json({ error: 'interface is required' });
-  }
-
-  try {
-    const args = [ifaceName, String(duration), String(vlanId), String(linkSpeed)];
-
-    const estimator = spawn(CBS_ESTIMATOR, args, {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    estimator.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-
-    estimator.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-
-    estimator.on('close', (code) => {
-      if (code !== 0) {
-        return res.status(500).json({
-          error: `Estimator exited with code ${code}`,
-          stderr
-        });
-      }
-
-      try {
-        const result = JSON.parse(stdout);
-        res.json(result);
-      } catch (e) {
-        res.json({
-          raw: stdout,
-          stderr
-        });
-      }
-    });
-
-    estimator.on('error', (err) => {
-      res.status(500).json({ error: err.message });
-    });
-
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -427,82 +352,68 @@ router.post('/estimate', async (req, res) => {
  * Get CBS status for all ports (1 and 2)
  */
 router.get('/ports', async (req, res) => {
-  const { transport, device, host, port } = req.query;
+  const device = req.query.device || DEFAULT_DEVICE;
   const results = {};
 
   try {
-    const yangCacheDir = await findYangCache();
-    const { loadYangInputs } = await import(`${TSC2CBOR_LIB}/common/input-loader.js`);
-    const { extractSidsFromInstanceIdentifier } = await import(`${TSC2CBOR_LIB}/encoder/transformer-instance-id.js`);
-    const { Cbor2TscConverter } = await import('../../tsc2cbor/cbor2tsc.js');
-
-    const { sidInfo } = await loadYangInputs(yangCacheDir, false);
-    const transportInstance = await createConnection({ transport, device, host, port });
-    const decoder = new Cbor2TscConverter(yangCacheDir);
-
     for (const portNum of ['1', '2']) {
+      const queryPath = buildCbsPath(portNum);
+      const yamlContent = `- ${queryPath}`;
+
       try {
-        const queryPath = buildCbsPath(portNum);
-        const queries = extractSidsFromInstanceIdentifier(
-          [{ [queryPath]: null }],
-          sidInfo,
-          { verbose: false }
-        );
+        const result = await executeKetiTsn('fetch', yamlContent, { device });
 
-        const response = await transportInstance.sendiFetchRequest(queries);
-
-        if (response.isSuccess() && response.payload && response.payload.length > 0) {
-          const result = await decoder.convertBuffer(response.payload, {
-            verbose: false,
-            outputFormat: 'rfc7951'
-          });
-          const cbsData = yaml.load(result.yaml);
-
-          // Parse TC configurations
+        if (result.success) {
+          // Parse YAML output
+          const lines = result.output.split('\n');
           const tcConfigs = {};
-          let shapers = [];
+          let currentTc = null;
 
-          if (cbsData) {
-            if (cbsData['traffic-class-shapers']) {
-              shapers = cbsData['traffic-class-shapers'];
-            } else if (cbsData['mchp-velocitysp-port:traffic-class-shapers']) {
-              shapers = cbsData['mchp-velocitysp-port:traffic-class-shapers'];
-            } else if (Array.isArray(cbsData)) {
-              for (const item of cbsData) {
-                const itemShapers = item?.['traffic-class-shapers'] ||
-                                   item?.['mchp-velocitysp-port:traffic-class-shapers'] || [];
-                shapers = shapers.concat(itemShapers);
-              }
+          for (const line of lines) {
+            const tcMatch = line.match(/traffic-class:\s*(\d+)/);
+            if (tcMatch) {
+              currentTc = parseInt(tcMatch[1]);
+              tcConfigs[currentTc] = {};
             }
-          }
 
-          if (!Array.isArray(shapers)) {
-            shapers = shapers ? [shapers] : [];
-          }
-
-          for (const shaper of shapers) {
-            const tc = shaper['traffic-class'];
-            if (shaper['credit-based']) {
-              tcConfigs[tc] = {
-                idleSlopeKbps: shaper['credit-based']['idle-slope'],
-                bandwidthPercent: (shaper['credit-based']['idle-slope'] * 1000) / (DEFAULT_LINK_SPEED_MBPS * 1000000) * 100
+            const slopeMatch = line.match(/idle-slope:\s*(\d+)/);
+            if (slopeMatch && currentTc !== null) {
+              const idleSlopeKbps = parseInt(slopeMatch[1]);
+              tcConfigs[currentTc] = {
+                idleSlopeKbps,
+                bandwidthPercent: (idleSlopeKbps / (DEFAULT_LINK_SPEED_MBPS * 1000)) * 100
               };
             }
           }
-          results[portNum] = { tcConfigs, raw: result.yaml };
+
+          results[portNum] = { tcConfigs, raw: result.output };
         } else {
-          results[portNum] = { tcConfigs: {}, message: 'No CBS configuration' };
+          results[portNum] = { tcConfigs: {}, error: result.error };
         }
       } catch (e) {
         results[portNum] = { error: e.message };
       }
     }
 
-    await transportInstance.disconnect();
-    res.json(results);
+    res.json({
+      linkSpeedMbps: DEFAULT_LINK_SPEED_MBPS,
+      ports: results
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+/**
+ * GET /api/cbs/link-speed
+ * Get actual link speed
+ */
+router.get('/link-speed', (req, res) => {
+  res.json({
+    linkSpeedMbps: DEFAULT_LINK_SPEED_MBPS,
+    linkSpeedKbps: DEFAULT_LINK_SPEED_MBPS * 1000,
+    linkSpeedBps: DEFAULT_LINK_SPEED_MBPS * 1000000
+  });
 });
 
 export default router;

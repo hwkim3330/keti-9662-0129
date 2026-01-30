@@ -1,658 +1,945 @@
 /**
- * CBS Dashboard - Credit-Based Shaper (IEEE 802.1Qav)
+ * CBS Dashboard - IEEE 802.1Qav Credit-Based Shaper
+ * Professional TSN Traffic Analysis Interface
  *
  * Features:
- * - Traffic test with per-TC capture
- * - Real-time TX/RX visualization
- * - CBS configuration (idleSlope per TC)
- * - Idle slope estimation from captured traffic
+ * - Real-time traffic visualization with Chart.js
+ * - Wireshark-style packet list
+ * - CBS configuration and monitoring
  */
 
 let api, ws, state;
 let currentPort = '2';
-let refreshTimer = null;
-let captureActive = false;
 let testRunning = false;
-let estimating = false;
-let statsHandler = null;
-let stoppedHandler = null;
-let syncHandler = null;
-let testStartTime = 0;
+let refreshTimer = null;
+
+// Charts
+let bandwidthChart = null;
+let throughputChart = null;
 
 // Data
-let txHistory = [];
-let rxHistory = [];
-let lastRxCounts = {};
 let rxTcStats = {};
 let txTcStats = {};
+let packetList = [];
+let throughputHistory = [];
+const MAX_PACKETS = 200;
+const MAX_HISTORY = 60;
 
-// Link speed (must be defined first)
-let linkSpeedMbps = 100;
-
-// Estimation results
-let estimationResults = null;
-
-
-// CBS Configuration per TC - 기본값: TC별로 다른 대역폭 할당
-// TC0-1: 낮음 (5%), TC2-3: 중간 (10%), TC4-5: 높음 (15%), TC6-7: 최고 (20%)
-const DEFAULT_BW_PERCENT = [5, 5, 10, 10, 15, 15, 20, 20];
-let cbsConfig = {};
-for (let i = 0; i < 8; i++) {
-  const bwPercent = DEFAULT_BW_PERCENT[i];
-  cbsConfig[i] = {
-    enabled: false,
-    idleSlope: (bwPercent / 100) * linkSpeedMbps * 1000000,  // bps
-    bandwidthPercent: bwPercent,
-    estimated: false
-  };
-}
+// Link speed (1 Gbps)
+const LINK_SPEED_MBPS = 1000;
+const LINK_SPEED_KBPS = LINK_SPEED_MBPS * 1000;
 
 // TC Colors
-const TC_HEX = [
-  '#94a3b8', '#64748b', '#475569', '#334155',
-  '#1e3a5f', '#1e40af', '#3730a3', '#4c1d95'
+const TC_COLORS = [
+  '#ef4444', '#f97316', '#eab308', '#22c55e',
+  '#14b8a6', '#3b82f6', '#8b5cf6', '#ec4899'
 ];
 
-// Select all TCs by default for traffic test
+// CBS Configuration
+let cbsConfig = {};
+for (let i = 0; i < 8; i++) {
+  cbsConfig[i] = { idleSlope: 0, measured: 0, enabled: false };
+}
+
+// Selected TCs for test
 let selectedTCs = [0, 1, 2, 3, 4, 5, 6, 7];
 
 export function render(appState) {
   state = appState;
 
   return `
-    <!-- Status Bar -->
-    <div class="cbs-status-bar">
-      <div class="status-item">
-        <span class="status-label">PORT</span>
-        <span class="status-value">${currentPort}</span>
-      </div>
-      <div class="status-item">
-        <span class="status-label">CBS</span>
-        <span class="status-value" id="cbs-status">--</span>
-      </div>
-      <div class="status-item">
-        <span class="status-label">LINK</span>
-        <span class="status-value">${linkSpeedMbps} Mbps</span>
-      </div>
-      <div class="status-item">
-        <span class="status-label">ACTIVE TCs</span>
-        <span class="status-value" id="active-tc-count">--</span>
-      </div>
-      <button class="btn btn-sm" id="refresh-cbs">Refresh</button>
-      <button class="btn btn-sm" id="reset-cbs">Reset</button>
-    </div>
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
-    <!-- Traffic Test -->
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">Traffic Test</span>
-        <div style="display:flex;gap:8px;align-items:center">
-          <span class="badge ${testRunning ? 'badge-success' : ''}" id="test-badge">${testRunning ? 'Running' : 'Ready'}</span>
-          <button class="btn btn-sm btn-success" id="start-btn" ${testRunning ? 'disabled' : ''}>Start</button>
-          <button class="btn btn-sm btn-danger" id="stop-btn" ${!testRunning ? 'disabled' : ''}>Stop</button>
+    <div class="cbs-dashboard">
+      <!-- Header -->
+      <div class="dash-header">
+        <div class="header-title">
+          <h1>CBS Traffic Shaper</h1>
+          <span class="subtitle">IEEE 802.1Qav Credit-Based Shaper | LAN9662</span>
         </div>
-      </div>
-      <div class="test-config">
-        <div class="tc-selector">
-          ${[0,1,2,3,4,5,6,7].map(tc => `
-            <button class="tc-btn ${selectedTCs.includes(tc) ? 'selected' : ''}" data-tc="${tc}"
-              style="--tc-color:${TC_HEX[tc]}" ${testRunning ? 'disabled' : ''}>TC${tc}</button>
-          `).join('')}
-        </div>
-        <div class="test-inputs">
-          <div class="input-group">
-            <label>TX</label>
-            <select id="tx-iface" class="input input-sm"></select>
-          </div>
-          <div class="input-group">
-            <label>RX</label>
-            <select id="rx-iface" class="input input-sm"></select>
-          </div>
-          <div class="input-group">
-            <label>PPS (Total)</label>
-            <input type="number" id="pps" value="4000" class="input input-sm" style="width:80px">
-          </div>
-          <div class="input-group">
-            <label>Duration</label>
-            <input type="number" id="duration" value="10" class="input input-sm" style="width:60px">
+        <div class="header-controls">
+          <select id="port-select" class="port-select">
+            <option value="1">Port 1</option>
+            <option value="2" selected>Port 2</option>
+          </select>
+          <div class="link-badge">
+            <span class="link-icon">●</span>
+            <span>${LINK_SPEED_MBPS} Mbps</span>
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- 3 Graphs: Idle Slope Comparison / TX / RX -->
-    <div class="grid-3-graphs">
-      <div class="card card-compact">
-        <div class="card-header">
-          <span class="card-title" style="font-size:0.8rem">Idle Slope (Config vs Measured)</span>
-          <span class="mono text-xs text-muted">BW%</span>
+      <!-- Top Section: Config + Test -->
+      <div class="top-grid">
+        <!-- CBS Configuration -->
+        <div class="panel">
+          <div class="panel-header">
+            <h2>CBS Configuration</h2>
+            <div class="panel-actions">
+              <button class="btn btn-sm" id="load-device-btn">Load from Device</button>
+              <button class="btn btn-primary" id="apply-btn">Apply</button>
+            </div>
+          </div>
+          <div class="config-table">
+            <div class="config-head">
+              <span>TC</span>
+              <span>Idle Slope (kbps)</span>
+              <span>Limit %</span>
+              <span>Measured</span>
+              <span>Status</span>
+            </div>
+            <div class="config-body" id="config-body">
+              ${renderConfigRows()}
+            </div>
+          </div>
+          <div class="preset-row">
+            <span class="preset-label">Presets:</span>
+            <button class="btn btn-xs" data-preset="low">Low (0.5-4 Mbps)</button>
+            <button class="btn btn-xs" data-preset="mid">Medium (5-40 Mbps)</button>
+            <button class="btn btn-xs" data-preset="high">High (50-400 Mbps)</button>
+            <button class="btn btn-xs" data-preset="clear">Clear</button>
+          </div>
         </div>
-        <canvas id="slope-canvas" height="140"></canvas>
-      </div>
-      <div class="card card-compact">
-        <div class="card-header">
-          <span class="card-title" style="font-size:0.8rem">TX Packets</span>
-          <span class="mono text-xs text-muted" id="tx-count">0</span>
-        </div>
-        <canvas id="tx-canvas" height="140"></canvas>
-      </div>
-      <div class="card card-compact">
-        <div class="card-header">
-          <span class="card-title" style="font-size:0.8rem">RX Packets</span>
-          <span class="mono text-xs text-muted" id="rx-count">0</span>
-        </div>
-        <canvas id="rx-canvas" height="140"></canvas>
-      </div>
-    </div>
 
-    <!-- CBS Configuration & Estimation -->
-    <div class="grid-2">
-      <div class="card card-compact">
-        <div class="card-header">
-          <span class="card-title" style="font-size:0.8rem">CBS Configuration</span>
-          <button class="btn btn-sm btn-primary" id="apply-cbs">Apply</button>
-        </div>
-        <div class="cbs-config-table">
-          <div class="cbs-header-row">
-            <span>TC</span>
-            <span>IdleSlope(kbps)</span>
-            <span>Cfg%</span>
-            <span>Meas%</span>
-            <span>En</span>
+        <!-- Traffic Test -->
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Traffic Generator</h2>
+            <div class="test-status" id="test-status">
+              <span class="status-dot"></span>
+              <span>Ready</span>
+            </div>
           </div>
-          <div id="cbs-config-rows">
-            ${[0,1,2,3,4,5,6,7].map(tc => renderCBSRow(tc)).join('')}
+          <div class="test-form">
+            <div class="form-row">
+              <div class="form-group">
+                <label>TX Interface</label>
+                <select id="tx-iface"></select>
+              </div>
+              <div class="form-group">
+                <label>RX Interface</label>
+                <select id="rx-iface"></select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Packets/sec</label>
+                <input type="number" id="pps" value="8000" min="100" max="100000">
+              </div>
+              <div class="form-group">
+                <label>Duration (s)</label>
+                <input type="number" id="duration" value="10" min="1" max="120">
+              </div>
+            </div>
+            <div class="tc-select">
+              <label>Traffic Classes:</label>
+              <div class="tc-buttons">
+                ${[0,1,2,3,4,5,6,7].map(tc => `
+                  <button class="tc-btn ${selectedTCs.includes(tc) ? 'active' : ''}" data-tc="${tc}" style="--tc-color: ${TC_COLORS[tc]}">
+                    TC${tc}
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+            <div class="test-actions">
+              <button class="btn btn-success btn-lg" id="start-btn">▶ Start Test</button>
+              <button class="btn btn-danger btn-lg" id="stop-btn" disabled>■ Stop</button>
+            </div>
           </div>
         </div>
       </div>
-      <div class="card card-compact">
-        <div class="card-header">
-          <span class="card-title" style="font-size:0.8rem">Idle Slope Estimator</span>
-          <div style="display:flex;gap:4px;align-items:center">
-            <span class="badge" id="estimate-badge" style="font-size:0.6rem">Auto</span>
-            <button class="btn btn-sm ${estimating ? '' : 'btn-primary'}" id="run-estimate" ${estimating ? 'disabled' : ''}>
-              ${estimating ? 'Estimating...' : 'Manual'}
-            </button>
-          </div>
-        </div>
-        <div class="estimate-info">
-          <span class="text-xs text-muted">테스트 완료 후 자동으로 아이들 슬로프 예측 및 적용</span>
-        </div>
-        <div id="estimate-results">
-          ${renderEstimationResults()}
-        </div>
-      </div>
-    </div>
 
-    <!-- TX / RX Statistics -->
-    <div class="grid-2">
-      <div class="card card-compact">
-        <div class="card-header">
-          <span class="card-title" style="font-size:0.8rem;color:#3b82f6">TX (Sent)</span>
-          <span class="text-xs text-muted" id="tx-pkt-count">0</span>
+      <!-- Charts Section -->
+      <div class="charts-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Bandwidth Allocation</h2>
+            <span class="chart-legend">Config (solid) vs Measured (striped)</span>
+          </div>
+          <div class="chart-container">
+            <canvas id="bandwidth-chart"></canvas>
+          </div>
         </div>
-        <div class="packet-table-container" style="max-height:200px">
-          <table class="packet-table">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Real-time Throughput</h2>
+            <span class="chart-legend" id="throughput-total">Total: 0 kbps</span>
+          </div>
+          <div class="chart-container">
+            <canvas id="throughput-chart"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- Packet List (Wireshark style) -->
+      <div class="panel packet-panel">
+        <div class="panel-header">
+          <h2>Packet Capture</h2>
+          <div class="panel-actions">
+            <span class="pkt-count" id="pkt-count">0 packets</span>
+            <button class="btn btn-xs" id="clear-pkts">Clear</button>
+            <button class="btn btn-xs" id="export-pkts">Export CSV</button>
+          </div>
+        </div>
+        <div class="packet-list-container">
+          <table class="packet-list">
             <thead>
               <tr>
-                <th>TC</th>
-                <th>Sent</th>
-                <th>BW%</th>
-                <th>IdleSlope</th>
+                <th class="col-no">No.</th>
+                <th class="col-time">Time</th>
+                <th class="col-tc">TC</th>
+                <th class="col-src">Source</th>
+                <th class="col-dst">Destination</th>
+                <th class="col-proto">Protocol</th>
+                <th class="col-len">Length</th>
+                <th class="col-info">Info</th>
               </tr>
             </thead>
-            <tbody id="tx-pkt-body"></tbody>
+            <tbody id="packet-body"></tbody>
           </table>
         </div>
       </div>
-      <div class="card card-compact">
-        <div class="card-header">
-          <span class="card-title" style="font-size:0.8rem;color:#10b981">RX (Received)</span>
-          <span class="text-xs text-muted" id="rx-pkt-count">0</span>
+
+      <!-- Results Summary -->
+      <div class="panel results-panel">
+        <div class="panel-header">
+          <h2>Shaping Analysis</h2>
+          <button class="btn btn-xs" id="analyze-btn">Analyze</button>
         </div>
-        <div class="packet-table-container" style="max-height:200px">
-          <table class="packet-table">
-            <thead>
-              <tr>
-                <th>TC</th>
-                <th>Recv</th>
-                <th>kbps</th>
-                <th>Shaped</th>
-              </tr>
-            </thead>
-            <tbody id="rx-pkt-body"></tbody>
-          </table>
+        <div class="results-grid" id="results-grid">
+          ${renderResultsGrid()}
         </div>
       </div>
-    </div>
-    <div style="text-align:right;margin-bottom:16px">
-      <button class="btn btn-sm" id="clear-pkts">Clear All</button>
     </div>
 
     <style>
-      .cbs-status-bar {
+      .cbs-dashboard {
+        padding: 16px;
+        max-width: 1600px;
+        margin: 0 auto;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+        font-size: 13px;
+        color: #1f2937;
+      }
+
+      /* Header */
+      .dash-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 16px;
+        padding-bottom: 12px;
+        border-bottom: 2px solid #e5e7eb;
+      }
+      .header-title h1 {
+        font-size: 20px;
+        font-weight: 600;
+        margin: 0 0 2px 0;
+        color: #111827;
+      }
+      .header-title .subtitle {
+        font-size: 11px;
+        color: #6b7280;
+      }
+      .header-controls {
         display: flex;
         align-items: center;
-        gap: 16px;
-        padding: 12px 16px;
-        background: var(--card);
-        border: 1px solid var(--border);
+        gap: 12px;
+      }
+      .port-select {
+        padding: 6px 12px;
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        font-size: 13px;
+        background: white;
+      }
+      .link-badge {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        background: #ecfdf5;
+        border: 1px solid #a7f3d0;
+        border-radius: 6px;
+        color: #059669;
+        font-weight: 500;
+        font-size: 12px;
+      }
+      .link-icon { color: #10b981; }
+
+      /* Panels */
+      .panel {
+        background: white;
+        border: 1px solid #e5e7eb;
         border-radius: 8px;
         margin-bottom: 16px;
       }
-      .status-item {
+      .panel-header {
         display: flex;
-        flex-direction: column;
-        gap: 2px;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px 16px;
+        border-bottom: 1px solid #f3f4f6;
       }
-      .status-label {
-        font-size: 0.6rem;
-        color: var(--text-muted);
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-      }
-      .status-value {
-        font-size: 0.85rem;
+      .panel-header h2 {
+        font-size: 14px;
         font-weight: 600;
-        font-family: ui-monospace, monospace;
+        margin: 0;
+        color: #374151;
       }
-      .status-value.active { color: var(--success); }
+      .panel-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
 
-      .card-compact { padding: 12px; margin-bottom: 16px; }
-      .card-compact .card-header { margin-bottom: 8px; }
-
-      .grid-3-graphs {
+      /* Grid layouts */
+      .top-grid {
         display: grid;
-        grid-template-columns: 1fr 1fr 1fr;
-        gap: 12px;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
         margin-bottom: 16px;
       }
-
-      .test-config {
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
+      .charts-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
       }
-      .tc-selector {
+
+      /* Buttons */
+      .btn {
+        padding: 8px 16px;
+        border: none;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .btn-primary { background: #3b82f6; color: white; }
+      .btn-primary:hover { background: #2563eb; }
+      .btn-success { background: #10b981; color: white; }
+      .btn-success:hover:not(:disabled) { background: #059669; }
+      .btn-danger { background: #ef4444; color: white; }
+      .btn-danger:hover:not(:disabled) { background: #dc2626; }
+      .btn-sm { padding: 6px 12px; font-size: 11px; }
+      .btn-xs { padding: 4px 8px; font-size: 10px; background: #f3f4f6; color: #374151; }
+      .btn-xs:hover { background: #e5e7eb; }
+      .btn-lg { padding: 10px 20px; font-size: 13px; }
+      .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+      /* Config Table */
+      .config-table {
+        padding: 0 16px;
+      }
+      .config-head, .config-row {
+        display: grid;
+        grid-template-columns: 50px 1fr 70px 80px 70px;
+        gap: 8px;
+        align-items: center;
+        padding: 8px 0;
+      }
+      .config-head {
+        font-size: 10px;
+        font-weight: 600;
+        color: #6b7280;
+        text-transform: uppercase;
+        border-bottom: 1px solid #e5e7eb;
+      }
+      .config-row {
+        border-bottom: 1px solid #f3f4f6;
+      }
+      .config-row:last-child { border-bottom: none; }
+      .tc-label {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 36px;
+        height: 22px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+        color: white;
+      }
+      .slope-input {
+        width: 100%;
+        padding: 6px 8px;
+        border: 1px solid #d1d5db;
+        border-radius: 4px;
+        font-size: 12px;
+        font-family: 'SF Mono', Monaco, monospace;
+        text-align: right;
+      }
+      .slope-input:focus {
+        outline: none;
+        border-color: #3b82f6;
+        box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
+      }
+      .limit-pct, .measured-val {
+        font-family: 'SF Mono', Monaco, monospace;
+        font-size: 11px;
+        text-align: center;
+      }
+      .status-badge {
+        font-size: 10px;
+        padding: 2px 6px;
+        border-radius: 3px;
+        text-align: center;
+      }
+      .status-badge.shaped { background: #dcfce7; color: #166534; }
+      .status-badge.unlimited { background: #f3f4f6; color: #6b7280; }
+
+      .preset-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 16px;
+        border-top: 1px solid #f3f4f6;
+      }
+      .preset-label {
+        font-size: 11px;
+        color: #6b7280;
+      }
+
+      /* Test Form */
+      .test-form {
+        padding: 16px;
+      }
+      .form-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+      .form-group label {
+        display: block;
+        font-size: 11px;
+        font-weight: 500;
+        color: #6b7280;
+        margin-bottom: 4px;
+      }
+      .form-group select, .form-group input {
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        font-size: 12px;
+      }
+      .tc-select {
+        margin-bottom: 16px;
+      }
+      .tc-select label {
+        display: block;
+        font-size: 11px;
+        font-weight: 500;
+        color: #6b7280;
+        margin-bottom: 8px;
+      }
+      .tc-buttons {
         display: flex;
         gap: 6px;
-        flex-wrap: wrap;
       }
       .tc-btn {
-        padding: 4px 10px;
-        border: 2px solid var(--border);
+        padding: 6px 12px;
+        border: 2px solid #e5e7eb;
         border-radius: 4px;
-        background: var(--card);
-        font-size: 0.7rem;
+        background: white;
+        font-size: 11px;
         font-weight: 600;
         cursor: pointer;
         transition: all 0.15s;
-        color: var(--text-muted);
+        color: #6b7280;
       }
       .tc-btn:hover { border-color: var(--tc-color); }
-      .tc-btn.selected {
-        border-color: var(--tc-color);
+      .tc-btn.active {
         background: var(--tc-color);
-        color: #fff;
+        border-color: var(--tc-color);
+        color: white;
       }
-      .tc-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-      .test-inputs {
+      .test-actions {
         display: flex;
         gap: 12px;
-        flex-wrap: wrap;
-        align-items: flex-end;
       }
-      .input-group {
+      .test-actions .btn { flex: 1; }
+      .test-status {
         display: flex;
-        flex-direction: column;
-        gap: 4px;
-      }
-      .input-group label {
-        font-size: 0.65rem;
-        color: var(--text-muted);
-        text-transform: uppercase;
-      }
-      .input-sm { padding: 6px 10px; font-size: 0.8rem; }
-
-      canvas {
-        width: 100%;
-        background: var(--bg);
-        border-radius: 4px;
-      }
-
-      .cbs-config-table {
-        font-size: 0.75rem;
-      }
-      .cbs-header-row, .cbs-config-row {
-        display: grid;
-        grid-template-columns: 32px 1fr 40px 45px 26px;
-        gap: 4px;
         align-items: center;
-        padding: 4px 0;
+        gap: 6px;
+        font-size: 12px;
+        color: #6b7280;
       }
-      .cbs-header-row {
-        border-bottom: 1px solid var(--border);
-        font-weight: 600;
-        color: var(--text-muted);
-        font-size: 0.65rem;
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #d1d5db;
       }
-      .cbs-config-row input[type="number"] {
-        width: 100%;
-        padding: 4px 6px;
-        border: 1px solid var(--border);
-        border-radius: 3px;
-        font-size: 0.75rem;
-        text-align: right;
+      .test-status.running .status-dot {
+        background: #10b981;
+        animation: pulse 1s infinite;
       }
-      .cbs-config-row input[type="checkbox"] {
-        width: 16px;
-        height: 16px;
-      }
-      .cbs-config-row .bw-percent,
-      .cbs-config-row .measured-percent {
-        font-family: ui-monospace, monospace;
-        font-size: 0.65rem;
-        text-align: center;
-      }
-      .cbs-config-row .bw-percent { color: var(--text-muted); }
-      .cbs-config-row .measured-percent { font-weight: 500; }
-      .cbs-config-row .tc-label {
-        font-weight: 600;
-      }
-      .cbs-config-row.estimated input[type="number"] {
-        background: #fef3c7;
-        border-color: #f59e0b;
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.4; }
       }
 
-      .estimate-info {
-        padding: 4px 8px;
-        background: #eff6ff;
-        border-radius: 4px;
-        margin-bottom: 8px;
+      /* Charts */
+      .chart-container {
+        padding: 16px;
+        height: 200px;
       }
-      #estimate-results {
-        padding: 8px;
-        min-height: 100px;
-      }
-      .estimate-empty {
-        padding: 30px;
-        text-align: center;
-        color: var(--text-light);
-        font-size: 0.8rem;
-      }
-      .estimate-grid-full {
-        display: grid;
-        grid-template-columns: 36px 60px 70px 50px 45px 50px;
-        gap: 2px;
-        font-size: 0.65rem;
-      }
-      .estimate-grid-full .header {
-        font-weight: 600;
-        color: var(--text-muted);
-        padding: 4px 2px;
-        border-bottom: 1px solid var(--border);
-        text-align: center;
-      }
-      .estimate-grid-full .cell {
-        padding: 3px 2px;
-        font-family: ui-monospace, monospace;
-        text-align: center;
-      }
-      .estimate-grid-full .shaped-yes { color: var(--success); font-weight: 600; }
-      .estimate-grid-full .shaped-no { color: var(--text-muted); }
-      .estimate-summary {
-        display: flex;
-        justify-content: space-between;
-        margin-top: 8px;
-        padding: 6px 8px;
-        background: var(--bg);
-        border-radius: 4px;
-        font-size: 0.7rem;
+      .chart-legend {
+        font-size: 10px;
+        color: #9ca3af;
       }
 
-      .packet-table-container {
-        max-height: 200px;
+      /* Packet List - Wireshark Style */
+      .packet-panel {
+        margin-bottom: 16px;
+        background: #fefefe;
+      }
+      .packet-list-container {
+        max-height: 300px;
         overflow-y: auto;
-        border: 1px solid var(--border);
-        border-radius: 4px;
+        background: #fff;
+        border-top: 2px solid #1f2937;
       }
-      .packet-table {
+      .packet-list {
         width: 100%;
         border-collapse: collapse;
-        font-size: 0.7rem;
-        font-family: ui-monospace, monospace;
+        font-size: 11px;
+        font-family: 'SF Mono', Monaco, Consolas, monospace;
       }
-      .packet-table th {
+      .packet-list th {
         position: sticky;
         top: 0;
-        background: var(--bg-dark);
-        color: #fff;
-        padding: 6px 8px;
-        text-align: left;
-        font-weight: 500;
-        font-size: 0.65rem;
-      }
-      .packet-table td {
-        padding: 4px 8px;
-        border-bottom: 1px solid var(--border);
-      }
-      .packet-table .tc-badge {
-        display: inline-block;
-        padding: 1px 6px;
-        border-radius: 2px;
-        color: #fff;
-        font-size: 0.65rem;
+        background: linear-gradient(180deg, #374151 0%, #1f2937 100%);
+        color: #e5e7eb;
         font-weight: 600;
+        text-align: left;
+        padding: 10px 12px;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        border-bottom: 2px solid #4f46e5;
+      }
+      .packet-list td {
+        padding: 7px 12px;
+        border-bottom: 1px solid #e5e7eb;
+        white-space: nowrap;
+        color: #374151;
+      }
+      .packet-list tbody tr:nth-child(even) td {
+        background: #f8fafc;
+      }
+      .packet-list tbody tr:hover td {
+        background: #e0f2fe !important;
+      }
+      .packet-list tr.selected td {
+        background: #dbeafe !important;
+        font-weight: 500;
+      }
+      .col-no {
+        width: 55px;
+        color: #6b7280;
+        font-weight: 500;
+      }
+      .col-time {
+        width: 90px;
+        color: #059669;
+      }
+      .col-tc { width: 45px; }
+      .col-src {
+        width: 130px;
+        color: #1d4ed8;
+      }
+      .col-dst {
+        width: 130px;
+        color: #7c3aed;
+      }
+      .col-proto {
+        width: 65px;
+        font-weight: 600;
+        color: #0891b2;
+      }
+      .col-len {
+        width: 60px;
+        text-align: right;
+        color: #6b7280;
+      }
+      .col-info {
+        color: #374151;
+      }
+      .pkt-count {
+        font-size: 11px;
+        color: #6b7280;
+        font-weight: 500;
+      }
+      .pkt-tc {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 28px;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 700;
+        color: white;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+      }
+
+      /* Results Grid - Enhanced Visual Style */
+      .results-panel {
+        background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+        border: none;
+      }
+      .results-panel .panel-header {
+        border-bottom: 1px solid rgba(255,255,255,0.1);
+      }
+      .results-panel .panel-header h2 {
+        color: white;
+      }
+      .results-panel .btn-xs {
+        background: rgba(255,255,255,0.1);
+        color: white;
+        border: 1px solid rgba(255,255,255,0.2);
+      }
+      .results-grid {
+        display: grid;
+        grid-template-columns: repeat(8, 1fr);
+        gap: 12px;
+        padding: 20px 16px;
+      }
+      .result-card {
+        text-align: center;
+        padding: 16px 10px;
+        background: rgba(255,255,255,0.05);
+        border-radius: 10px;
+        border: 1px solid rgba(255,255,255,0.1);
+        transition: all 0.3s ease;
+        position: relative;
+        overflow: hidden;
+      }
+      .result-card::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: var(--tc-color, #6b7280);
+        opacity: 0.5;
+      }
+      .result-card:hover {
+        transform: translateY(-2px);
+        background: rgba(255,255,255,0.08);
+        box-shadow: 0 8px 20px rgba(0,0,0,0.3);
+      }
+      .result-card.shaped {
+        background: linear-gradient(180deg, rgba(34,197,94,0.15) 0%, rgba(34,197,94,0.05) 100%);
+        border-color: rgba(34,197,94,0.3);
+      }
+      .result-card.shaped::before {
+        background: linear-gradient(90deg, #22c55e, #10b981);
+        opacity: 1;
+      }
+      .result-tc {
+        font-size: 12px;
+        font-weight: 700;
+        margin-bottom: 8px;
+        color: white;
+        text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+      }
+      .result-value {
+        font-family: 'SF Mono', Monaco, monospace;
+        font-size: 20px;
+        font-weight: 700;
+        color: white;
+        text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+      }
+      .result-label {
+        font-size: 10px;
+        color: rgba(255,255,255,0.6);
+        margin-top: 4px;
+      }
+      .result-bar {
+        height: 4px;
+        background: rgba(255,255,255,0.1);
+        border-radius: 2px;
+        margin-top: 8px;
+        overflow: hidden;
+      }
+      .result-bar-fill {
+        height: 100%;
+        border-radius: 2px;
+        transition: width 0.5s ease;
+      }
+      .result-status {
+        font-size: 10px;
+        font-weight: 600;
+        margin-top: 8px;
+        padding: 3px 8px;
+        border-radius: 4px;
+        display: inline-block;
+      }
+      .result-status.shaped {
+        background: rgba(34,197,94,0.2);
+        color: #4ade80;
+      }
+      .result-status.unlimited {
+        background: rgba(255,255,255,0.1);
+        color: rgba(255,255,255,0.5);
       }
     </style>
   `;
 }
 
-function renderCBSRow(tc) {
-  const cfg = cbsConfig[tc];
-  const idleSlopeKbps = cfg.idleSlope / 1000;
-  const bwPercent = cfg.bandwidthPercent || 0;
-  const measuredPercent = cfg.measuredPercent || 0;
+function renderConfigRows() {
+  let html = '';
+  for (let tc = 0; tc < 8; tc++) {
+    const cfg = cbsConfig[tc];
+    const limitPct = cfg.idleSlope > 0 ? (cfg.idleSlope / LINK_SPEED_KBPS * 100).toFixed(2) : '--';
+    const measured = rxTcStats[tc]?.kbps || 0;
+    const isShaped = cfg.idleSlope > 0;
 
-  return `
-    <div class="cbs-config-row ${cfg.estimated ? 'estimated' : ''}" data-tc="${tc}">
-      <span class="tc-label" style="color:${TC_HEX[tc]}">TC${tc}</span>
-      <input type="number" class="idle-slope-input" value="${idleSlopeKbps.toFixed(0)}" min="0" max="${linkSpeedMbps * 1000}" step="100">
-      <span class="bw-percent">${bwPercent.toFixed(0)}%</span>
-      <span class="measured-percent" style="color:${measuredPercent > 0 ? '#10b981' : '#cbd5e1'}">${measuredPercent > 0 ? measuredPercent.toFixed(1) + '%' : '-'}</span>
-      <input type="checkbox" class="cbs-enable" ${cfg.enabled ? 'checked' : ''}>
-    </div>
-  `;
-}
-
-function renderEstimationResults() {
-  if (!estimationResults || !estimationResults.tc) {
-    return '<div class="estimate-empty">테스트 시작하면 자동 예측됩니다</div>';
-  }
-
-  const tcs = Object.keys(estimationResults.tc).map(Number).sort((a, b) => a - b);
-  if (tcs.length === 0) {
-    return '<div class="estimate-empty">캡처된 트래픽 없음</div>';
-  }
-
-  let html = '<div class="estimate-grid-full">';
-  html += `
-    <div class="header">TC</div>
-    <div class="header">Measured</div>
-    <div class="header">IdleSlope</div>
-    <div class="header">BW%</div>
-    <div class="header">Bursts</div>
-    <div class="header">Shaped</div>
-  `;
-
-  for (const tc of tcs) {
-    const data = estimationResults.tc[tc];
-    const shaped = data.is_shaped;
-    const bwPercent = data.bandwidth_percent || 0;
     html += `
-      <div class="cell" style="color:${TC_HEX[tc]};font-weight:600">TC${tc}</div>
-      <div class="cell">${data.measured_kbps.toFixed(0)}</div>
-      <div class="cell">${(data.estimated_idle_slope_bps / 1000).toFixed(0)}</div>
-      <div class="cell">${bwPercent.toFixed(1)}%</div>
-      <div class="cell">${data.bursts || '-'}</div>
-      <div class="cell ${shaped ? 'shaped-yes' : 'shaped-no'}">${shaped ? 'YES' : 'NO'}</div>
+      <div class="config-row" data-tc="${tc}">
+        <span class="tc-label" style="background: ${TC_COLORS[tc]}">TC${tc}</span>
+        <input type="number" class="slope-input" value="${cfg.idleSlope}" min="0" max="${LINK_SPEED_KBPS}" step="100" data-tc="${tc}">
+        <span class="limit-pct">${limitPct}%</span>
+        <span class="measured-val">${measured > 0 ? measured.toFixed(0) + ' kbps' : '--'}</span>
+        <span class="status-badge ${isShaped ? 'shaped' : 'unlimited'}">${isShaped ? 'SHAPED' : 'OFF'}</span>
+      </div>
     `;
   }
-
-  html += '</div>';
-
-  // Summary
-  const totalBw = tcs.reduce((sum, tc) => sum + (estimationResults.tc[tc].bandwidth_percent || 0), 0);
-  html += `<div class="estimate-summary">
-    <span>Total BW: <strong>${totalBw.toFixed(1)}%</strong></span>
-    <span>TCs: <strong>${tcs.length}</strong></span>
-  </div>`;
-
   return html;
 }
 
-export async function init(appState, deps) {
-  state = appState;
-  api = deps.api;
-  ws = deps.ws;
+function renderResultsGrid() {
+  let html = '';
+  for (let tc = 0; tc < 8; tc++) {
+    const cfg = cbsConfig[tc];
+    const measured = rxTcStats[tc]?.kbps || 0;
+    const limit = cfg.idleSlope || 0;
+    const isShaped = limit > 0 && measured > 0;
+    const bwPct = measured > 0 ? (measured / LINK_SPEED_KBPS * 100).toFixed(2) : '0.00';
 
-  setupEvents();
-  await loadInterfaces();
-  await loadStatus();
+    // Calculate bar fill percentage (relative to limit if shaped, or just a visual indicator)
+    const barPct = limit > 0 && measured > 0
+      ? Math.min(100, (measured / limit) * 100)
+      : (measured > 0 ? 50 : 0);
 
-  if (ws && ws.on) {
-    // Remove old handlers first
-    if (statsHandler) ws.off('c-capture-stats', statsHandler);
-    if (stoppedHandler) ws.off('c-capture-stopped', stoppedHandler);
-    if (syncHandler) ws.off('sync', syncHandler);
-
-    // Create and register new handlers
-    statsHandler = handleStats;
-    stoppedHandler = () => {
-      if (Date.now() - testStartTime < 2000) return;
-      if (testRunning) stopTest();
-    };
-    syncHandler = (data) => {
-      if (data && data.cCapture && data.cCapture.running) {
-        captureActive = true;
-        testRunning = true;
-        updateUI();
+    // Status logic
+    let statusText, statusClass;
+    if (limit > 0) {
+      if (measured > 0) {
+        const ratio = measured / limit;
+        if (ratio >= 0.9) {
+          statusText = '✓ SHAPED';
+          statusClass = 'shaped';
+        } else {
+          statusText = `${(ratio * 100).toFixed(0)}% LIMIT`;
+          statusClass = 'shaped';
+        }
+      } else {
+        statusText = `LIMIT ${limit}`;
+        statusClass = 'unlimited';
       }
-    };
+    } else {
+      statusText = measured > 0 ? 'UNLIMITED' : 'OFF';
+      statusClass = 'unlimited';
+    }
 
-    ws.on('c-capture-stats', statsHandler);
-    ws.on('c-capture-stopped', stoppedHandler);
-    ws.on('sync', syncHandler);
+    html += `
+      <div class="result-card ${isShaped ? 'shaped' : ''}" style="--tc-color: ${TC_COLORS[tc]}">
+        <div class="result-tc">TC${tc}</div>
+        <div class="result-value">${measured > 0 ? measured.toFixed(0) : '--'}</div>
+        <div class="result-label">kbps (${bwPct}%)</div>
+        <div class="result-bar">
+          <div class="result-bar-fill" style="width: ${barPct}%; background: ${TC_COLORS[tc]}"></div>
+        </div>
+        <div class="result-status ${statusClass}">${statusText}</div>
+      </div>
+    `;
+  }
+  return html;
+}
+
+function updateConfigUI() {
+  const body = document.getElementById('config-body');
+  if (body) body.innerHTML = renderConfigRows();
+}
+
+function updateResultsUI() {
+  const grid = document.getElementById('results-grid');
+  if (grid) grid.innerHTML = renderResultsGrid();
+}
+
+// Initialize Chart.js charts
+function initCharts() {
+  // Wait for Chart.js to load
+  if (typeof Chart === 'undefined') {
+    setTimeout(initCharts, 100);
+    return;
   }
 
-  // Check if a capture is already running
+  // Bandwidth allocation chart (bar)
+  const bwCtx = document.getElementById('bandwidth-chart')?.getContext('2d');
+  if (bwCtx) {
+    bandwidthChart = new Chart(bwCtx, {
+      type: 'bar',
+      data: {
+        labels: ['TC0', 'TC1', 'TC2', 'TC3', 'TC4', 'TC5', 'TC6', 'TC7'],
+        datasets: [
+          {
+            label: 'Configured Limit',
+            data: [0, 0, 0, 0, 0, 0, 0, 0],
+            backgroundColor: TC_COLORS.map(c => c + '60'),
+            borderColor: TC_COLORS,
+            borderWidth: 2
+          },
+          {
+            label: 'Measured',
+            data: [0, 0, 0, 0, 0, 0, 0, 0],
+            backgroundColor: TC_COLORS,
+            borderColor: TC_COLORS,
+            borderWidth: 0
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'top', labels: { boxWidth: 12, font: { size: 10 } } }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            title: { display: true, text: 'kbps', font: { size: 10 } }
+          }
+        }
+      }
+    });
+  }
+
+  // Throughput chart (line)
+  const tpCtx = document.getElementById('throughput-chart')?.getContext('2d');
+  if (tpCtx) {
+    throughputChart = new Chart(tpCtx, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: TC_COLORS.map((color, tc) => ({
+          label: `TC${tc}`,
+          data: [],
+          borderColor: color,
+          backgroundColor: color + '20',
+          borderWidth: 1.5,
+          fill: false,
+          tension: 0.2,
+          pointRadius: 0
+        }))
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        plugins: {
+          legend: { position: 'top', labels: { boxWidth: 8, font: { size: 9 } } }
+        },
+        scales: {
+          x: { display: true, title: { display: false } },
+          y: { beginAtZero: true, title: { display: true, text: 'kbps', font: { size: 10 } } }
+        }
+      }
+    });
+  }
+}
+
+function updateCharts() {
+  if (!bandwidthChart || !throughputChart) return;
+
+  // Update bandwidth chart
+  const configData = [];
+  const measuredData = [];
+  for (let tc = 0; tc < 8; tc++) {
+    configData.push(cbsConfig[tc].idleSlope || 0);
+    measuredData.push(rxTcStats[tc]?.kbps || 0);
+  }
+  bandwidthChart.data.datasets[0].data = configData;
+  bandwidthChart.data.datasets[1].data = measuredData;
+  bandwidthChart.update('none');
+
+  // Update total throughput display
+  const total = measuredData.reduce((a, b) => a + b, 0);
+  const totalEl = document.getElementById('throughput-total');
+  if (totalEl) totalEl.textContent = `Total: ${total.toFixed(0)} kbps`;
+}
+
+function addThroughputSample() {
+  if (!throughputChart) return;
+
+  const now = new Date().toLocaleTimeString('en-US', { hour12: false });
+  throughputChart.data.labels.push(now);
+
+  for (let tc = 0; tc < 8; tc++) {
+    const kbps = rxTcStats[tc]?.kbps || 0;
+    throughputChart.data.datasets[tc].data.push(kbps);
+  }
+
+  // Keep only last MAX_HISTORY points
+  if (throughputChart.data.labels.length > MAX_HISTORY) {
+    throughputChart.data.labels.shift();
+    throughputChart.data.datasets.forEach(ds => ds.data.shift());
+  }
+
+  throughputChart.update('none');
+}
+
+// Packet list functions
+function addPacket(pkt) {
+  packetList.unshift(pkt);
+  if (packetList.length > MAX_PACKETS) packetList.pop();
+  renderPacketList();
+}
+
+function renderPacketList() {
+  const body = document.getElementById('packet-body');
+  if (!body) return;
+
+  body.innerHTML = packetList.slice(0, 100).map((p, i) => `
+    <tr>
+      <td class="col-no">${packetList.length - i}</td>
+      <td class="col-time">${p.time}</td>
+      <td class="col-tc"><span class="pkt-tc" style="background: ${TC_COLORS[p.tc]}">${p.tc}</span></td>
+      <td class="col-src">${p.src}</td>
+      <td class="col-dst">${p.dst}</td>
+      <td class="col-proto">${p.proto}</td>
+      <td class="col-len">${p.len}</td>
+      <td class="col-info">${p.info}</td>
+    </tr>
+  `).join('');
+
+  const countEl = document.getElementById('pkt-count');
+  if (countEl) countEl.textContent = `${packetList.length} packets`;
+}
+
+// API functions
+async function loadStatus() {
   try {
-    const status = await api.capture.status();
-    if (status && status.running) {
-      captureActive = true;
-      testRunning = true;
-      testStartTime = Date.now() - 5000;
-      updateUI();
+    const data = await api.cbs.getStatus(currentPort);
+    if (data.tcConfigs) {
+      for (const [tc, cfg] of Object.entries(data.tcConfigs)) {
+        cbsConfig[parseInt(tc)].idleSlope = cfg.idleSlopeKbps || 0;
+      }
     }
-  } catch (e) {}
-
-  refreshTimer = setInterval(loadStatus, 5000);
-  drawGraphs();
-  updatePacketTables();
-}
-
-export function cleanup() {
-  if (refreshTimer) clearInterval(refreshTimer);
-  testRunning = false;
-  captureActive = false;
-  estimating = false;
-
-  if (ws && ws.off) {
-    if (statsHandler) ws.off('c-capture-stats', statsHandler);
-    if (stoppedHandler) ws.off('c-capture-stopped', stoppedHandler);
-    if (syncHandler) ws.off('sync', syncHandler);
+    updateConfigUI();
+    updateCharts();
+  } catch (e) {
+    console.error('[CBS] Load status failed:', e);
   }
-  statsHandler = null;
-  stoppedHandler = null;
-  syncHandler = null;
-}
-
-function setupEvents() {
-  // Refresh CBS status
-  document.getElementById('refresh-cbs')?.addEventListener('click', loadStatus);
-
-  // Reset CBS
-  document.getElementById('reset-cbs')?.addEventListener('click', async () => {
-    if (!confirm('Reset all CBS configuration?')) return;
-    for (let i = 0; i < 8; i++) {
-      cbsConfig[i] = { enabled: false, idleSlope: 0, bandwidthPercent: 0, estimated: false };
-    }
-    document.getElementById('cbs-config-rows').innerHTML =
-      [0,1,2,3,4,5,6,7].map(tc => renderCBSRow(tc)).join('');
-  });
-
-  // TC selection
-  document.querySelector('.tc-selector')?.addEventListener('click', e => {
-    if (e.target.classList.contains('tc-btn') && !testRunning) {
-      const tc = parseInt(e.target.dataset.tc);
-      const idx = selectedTCs.indexOf(tc);
-      if (idx > -1) selectedTCs.splice(idx, 1);
-      else selectedTCs.push(tc);
-      selectedTCs.sort((a, b) => a - b);
-      e.target.classList.toggle('selected');
-    }
-  });
-
-  // Test buttons
-  document.getElementById('start-btn')?.addEventListener('click', startTest);
-  document.getElementById('stop-btn')?.addEventListener('click', stopTest);
-
-  // CBS config inputs
-  document.getElementById('cbs-config-rows')?.addEventListener('input', e => {
-    if (e.target.classList.contains('idle-slope-input')) {
-      const row = e.target.closest('.cbs-config-row');
-      const tc = parseInt(row.dataset.tc);
-      const kbps = parseFloat(e.target.value) || 0;
-      cbsConfig[tc].idleSlope = kbps * 1000;
-      cbsConfig[tc].bandwidthPercent = (cbsConfig[tc].idleSlope / (linkSpeedMbps * 1000000)) * 100;
-      cbsConfig[tc].estimated = false;
-      row.classList.remove('estimated');
-      row.querySelector('.bw-percent').textContent = cbsConfig[tc].bandwidthPercent.toFixed(1) + '%';
-    }
-  });
-
-  document.getElementById('cbs-config-rows')?.addEventListener('change', e => {
-    if (e.target.classList.contains('cbs-enable')) {
-      const row = e.target.closest('.cbs-config-row');
-      const tc = parseInt(row.dataset.tc);
-      cbsConfig[tc].enabled = e.target.checked;
-    }
-  });
-
-  // Apply CBS
-  document.getElementById('apply-cbs')?.addEventListener('click', applyCBS);
-
-  // Run estimation
-  document.getElementById('run-estimate')?.addEventListener('click', runEstimate);
-
-  // Apply estimate results
-  document.getElementById('estimate-results')?.addEventListener('click', e => {
-    if (e.target.id === 'apply-estimate') {
-      applyEstimateToConfig();
-    }
-  });
-
-  // Clear packets
-  document.getElementById('clear-pkts')?.addEventListener('click', () => {
-    txHistory = [];
-    rxHistory = [];
-    lastRxCounts = {};
-    rxTcStats = {};
-    txTcStats = {};
-    updatePacketTables();
-    drawGraphs();
-  });
 }
 
 async function loadInterfaces() {
@@ -671,138 +958,39 @@ async function loadInterfaces() {
       if (tx) tx.value = usb[0].name;
       if (rx) rx.value = usb[1].name;
     }
-  } catch (e) {}
-}
-
-async function loadStatus() {
-  try {
-    const data = await api.cbs.getStatus(currentPort);
-    // Update status display
-    const statusEl = document.getElementById('cbs-status');
-    if (statusEl) {
-      statusEl.textContent = data.config ? 'Active' : '--';
-    }
   } catch (e) {
-    const statusEl = document.getElementById('cbs-status');
-    if (statusEl) statusEl.textContent = '--';
+    console.error('[CBS] Load interfaces failed:', e);
   }
-
-  // Update active TC count
-  const activeTcs = Object.values(cbsConfig).filter(c => c.enabled).length;
-  const tcCountEl = document.getElementById('active-tc-count');
-  if (tcCountEl) tcCountEl.textContent = activeTcs;
 }
 
-async function applyCBS() {
-  const btn = document.getElementById('apply-cbs');
-  btn.disabled = true;
-  btn.textContent = 'Applying...';
+async function applyConfig() {
+  const btn = document.getElementById('apply-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Applying...'; }
 
   try {
-    const enabledTcs = Object.entries(cbsConfig)
-      .filter(([tc, cfg]) => cfg.enabled && cfg.idleSlope > 0)
-      .map(([tc, cfg]) => ({ tc: parseInt(tc), ...cfg }));
-
-    if (enabledTcs.length === 0) {
-      alert('No TCs enabled with idle slope configured');
-      return;
+    let count = 0;
+    for (let tc = 0; tc < 8; tc++) {
+      if (cbsConfig[tc].idleSlope > 0) {
+        await api.cbs.configure(currentPort, {
+          tc: tc,
+          idleSlope: cbsConfig[tc].idleSlope
+        });
+        count++;
+      }
     }
-
-    for (const tcCfg of enabledTcs) {
-      await api.cbs.configure(currentPort, {
-        tc: tcCfg.tc,
-        idleSlope: tcCfg.idleSlope,
-        linkSpeed: linkSpeedMbps
-      });
-    }
-
-    alert(`Applied CBS config for ${enabledTcs.length} TCs`);
+    console.log(`[CBS] Applied ${count} TC configurations`);
+    await loadStatus();
   } catch (e) {
-    alert('Error: ' + e.message);
+    alert('Apply failed: ' + e.message);
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Apply';
+    if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
   }
-}
-
-async function runEstimate() {
-  // Use current RX stats to estimate
-  if (Object.keys(rxTcStats).length === 0) {
-    alert('Run traffic test first');
-    return;
-  }
-
-  const btn = document.getElementById('run-estimate');
-  btn.disabled = true;
-  estimating = true;
-  btn.textContent = 'Analyzing...';
-
-  try {
-    // Use captured RX stats
-    estimationResults = { tc: {} };
-
-    for (const [tc, stats] of Object.entries(rxTcStats)) {
-      const tcNum = parseInt(tc);
-      const measuredKbps = stats.kbps || 0;
-      const measuredBps = measuredKbps * 1000;
-      const bwPercent = (measuredBps / (linkSpeedMbps * 1000000)) * 100;
-
-      estimationResults.tc[tcNum] = {
-        packets: stats.count,
-        measured_kbps: measuredKbps,
-        estimated_idle_slope_bps: measuredBps,
-        bandwidth_percent: bwPercent,
-        bursts: '-',
-        is_shaped: bwPercent < (cbsConfig[tcNum]?.bandwidthPercent || 100) * 1.1
-      };
-
-      // Update config with measured values
-      cbsConfig[tcNum] = {
-        ...cbsConfig[tcNum],
-        measuredSlope: measuredBps,
-        measuredPercent: bwPercent,
-        estimated: true
-      };
-    }
-
-    document.getElementById('estimate-results').innerHTML = renderEstimationResults();
-    document.getElementById('cbs-config-rows').innerHTML =
-      [0,1,2,3,4,5,6,7].map(tc => renderCBSRow(tc)).join('');
-    drawGraphs();
-
-  } catch (e) {
-    alert('Estimation error: ' + e.message);
-  } finally {
-    btn.disabled = false;
-    estimating = false;
-    btn.textContent = 'Manual';
-  }
-}
-
-function applyEstimateToConfig() {
-  if (!estimationResults || !estimationResults.tc) return;
-
-  for (const [tc, data] of Object.entries(estimationResults.tc)) {
-    const tcNum = parseInt(tc);
-    cbsConfig[tcNum] = {
-      enabled: true,
-      idleSlope: data.estimated_idle_slope_bps,
-      bandwidthPercent: data.bandwidth_percent,
-      estimated: true
-    };
-  }
-
-  // Re-render config rows
-  document.getElementById('cbs-config-rows').innerHTML =
-    [0,1,2,3,4,5,6,7].map(tc => renderCBSRow(tc)).join('');
-
-  loadStatus();
 }
 
 async function startTest() {
   const txIface = document.getElementById('tx-iface')?.value;
   const rxIface = document.getElementById('rx-iface')?.value;
-  const pps = parseInt(document.getElementById('pps')?.value) || 2000;  // Higher default PPS
+  const pps = parseInt(document.getElementById('pps')?.value) || 8000;
   const duration = parseInt(document.getElementById('duration')?.value) || 10;
 
   if (!txIface || !rxIface) return alert('Select interfaces');
@@ -812,87 +1000,20 @@ async function startTest() {
   try {
     const r = await api.system.getMac(rxIface);
     dstMac = r.mac;
-  } catch { return alert('Could not get MAC'); }
+  } catch { return alert('Could not get MAC address'); }
 
-  txHistory = [];
-  rxHistory = [];
-  lastRxCounts = {};
+  // Reset stats
   rxTcStats = {};
   txTcStats = {};
+  packetList = [];
+  throughputHistory = [];
+  if (throughputChart) {
+    throughputChart.data.labels = [];
+    throughputChart.data.datasets.forEach(ds => ds.data = []);
+  }
+
   testRunning = true;
-  captureActive = true;
-  testStartTime = Date.now();
-  updateUI();
-  updatePacketTables();
-
-  // CBS 테스트용 설정
-  // 프레임 크기 1000바이트 = 8000비트
-  // 1000 pps/TC → 8 Mbps/TC
-  // 2000 pps/TC → 16 Mbps/TC
-  const frameSize = 1000;  // bytes
-  const bitsPerFrame = frameSize * 8;
-  const ppsPerTC = Math.floor(pps / selectedTCs.length);
-  const expectedMbpsPerTC = (ppsPerTC * bitsPerFrame) / 1000000;
-
-  // CBS 한도를 보낸 트래픽의 50-80%로 설정 (shaping 효과 확인용)
-  // TC별로 다른 한도 설정
-  const cbsLimitRatios = [0.3, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8];
-
-  selectedTCs.forEach(tc => {
-    const limitRatio = cbsLimitRatios[tc];
-    const targetMbps = expectedMbpsPerTC * limitRatio;
-    const idleSlope = targetMbps * 1000000;  // bps
-    const bwPercent = (idleSlope / (linkSpeedMbps * 1000000)) * 100;
-
-    cbsConfig[tc] = {
-      enabled: true,
-      idleSlope: idleSlope,
-      bandwidthPercent: bwPercent,
-      expectedTxMbps: expectedMbpsPerTC,
-      estimated: false
-    };
-  });
-
-  console.log(`[CBS Test] PPS=${pps}, PPS/TC=${ppsPerTC}, Expected TX=${expectedMbpsPerTC.toFixed(1)} Mbps/TC`);
-  console.log(`[CBS Test] Frame size=${frameSize}B, Selected TCs:`, selectedTCs);
-
-  // Update config UI
-  document.getElementById('cbs-config-rows').innerHTML =
-    [0,1,2,3,4,5,6,7].map(tc => renderCBSRow(tc)).join('');
-  loadStatus();
-
-  // Start TX tracking timer
-  let elapsed = 0;
-  const interval = 200;
-  const pktsPerIntervalPerTC = ppsPerTC * (interval / 1000);
-
-  const txTimer = setInterval(() => {
-    if (!testRunning || elapsed > duration * 1000) {
-      clearInterval(txTimer);
-      return;
-    }
-    elapsed += interval;
-    const txEntry = { time: elapsed, tc: {} };
-
-    selectedTCs.forEach(tc => {
-      const cfg = cbsConfig[tc];
-      const packetsToSend = Math.floor(pktsPerIntervalPerTC);
-
-      txEntry.tc[tc] = packetsToSend;
-
-      if (!txTcStats[tc]) {
-        const txMbps = (ppsPerTC * bitsPerFrame) / 1000000;
-        txTcStats[tc] = { count: 0, pps: ppsPerTC, bwPercent: cfg.bandwidthPercent, txMbps };
-      }
-      txTcStats[tc].count += packetsToSend;
-    });
-
-    txHistory.push(txEntry);
-    if (txHistory.length > 200) txHistory.shift();
-
-    updatePacketTables();
-    drawGraphs();
-  }, interval);
+  updateTestUI();
 
   try {
     try { await api.capture.stop(); await api.traffic.stop(); } catch {}
@@ -903,367 +1024,195 @@ async function startTest() {
       dstMac,
       vlanId: 100,
       tcList: selectedTCs,
-      packetsPerSecond: pps,  // Total PPS (divided among TCs by C sender)
+      packetsPerSecond: pps,
       duration,
-      frameSize
+      frameSize: 1000
     });
 
-    // Schedule automatic estimation after traffic completes
-    setTimeout(async () => {
-      await runAutoEstimate(rxIface, duration);
-    }, (duration + 1) * 1000);
+    // Stop after duration
+    setTimeout(() => {
+      if (testRunning) stopTest();
+    }, (duration + 2) * 1000);
 
   } catch (e) {
-    console.error('[CBS] API error:', e.message);
-  }
-}
-
-// Auto-run estimation after traffic test using capture stats
-async function runAutoEstimate(rxIface, duration) {
-  if (!testRunning && !captureActive) return;
-
-  const btn = document.getElementById('run-estimate');
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = 'Analyzing...';
-  }
-  estimating = true;
-
-  try {
-    // Use captured RX stats to estimate idle slope (no sudo needed)
-    estimationResults = { tc: {} };
-
-    for (const [tc, stats] of Object.entries(rxTcStats)) {
-      const tcNum = parseInt(tc);
-      const measuredKbps = stats.kbps || 0;
-      const measuredBps = measuredKbps * 1000;
-      const bwPercent = (measuredBps / (linkSpeedMbps * 1000000)) * 100;
-
-      estimationResults.tc[tcNum] = {
-        packets: stats.count,
-        measured_kbps: measuredKbps,
-        estimated_idle_slope_bps: measuredBps,
-        bandwidth_percent: bwPercent,
-        bursts: '-',
-        is_shaped: bwPercent < (cbsConfig[tcNum]?.bandwidthPercent || 100) * 1.1
-      };
-    }
-
-    // Update estimation results display
-    document.getElementById('estimate-results').innerHTML = renderEstimationResults();
-
-    // Auto-apply estimation to CBS config
-    if (Object.keys(estimationResults.tc).length > 0) {
-      for (const [tc, data] of Object.entries(estimationResults.tc)) {
-        const tcNum = parseInt(tc);
-        cbsConfig[tcNum] = {
-          ...cbsConfig[tcNum],
-          measuredSlope: data.estimated_idle_slope_bps,
-          measuredPercent: data.bandwidth_percent,
-          estimated: true
-        };
-      }
-
-      // Re-render config rows with estimated values
-      document.getElementById('cbs-config-rows').innerHTML =
-        [0,1,2,3,4,5,6,7].map(tc => renderCBSRow(tc)).join('');
-
-      loadStatus();
-      drawGraphs();  // Redraw with estimation data
-      console.log('[CBS] Auto-applied estimation from capture stats');
-    }
-  } catch (e) {
-    console.error('[CBS] Auto estimation error:', e.message);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = 'Manual';
-    }
-    estimating = false;
+    console.error('[CBS] Start test failed:', e);
     testRunning = false;
-    captureActive = false;
-    updateUI();
+    updateTestUI();
   }
 }
 
 async function stopTest() {
   testRunning = false;
-  captureActive = false;
   try { await api.capture.stop(); await api.traffic.stop(); } catch {}
-  updateUI();
+  updateTestUI();
+  updateResultsUI();
 }
 
-function updateUI() {
-  document.getElementById('start-btn').disabled = testRunning;
-  document.getElementById('stop-btn').disabled = !testRunning;
-  const badge = document.getElementById('test-badge');
-  badge.textContent = testRunning ? 'Running' : 'Ready';
-  badge.className = `badge ${testRunning ? 'badge-success' : ''}`;
+function updateTestUI() {
+  const startBtn = document.getElementById('start-btn');
+  const stopBtn = document.getElementById('stop-btn');
+  const statusEl = document.getElementById('test-status');
+
+  if (startBtn) startBtn.disabled = testRunning;
+  if (stopBtn) stopBtn.disabled = !testRunning;
+  if (statusEl) {
+    statusEl.className = `test-status ${testRunning ? 'running' : ''}`;
+    statusEl.querySelector('span:last-child').textContent = testRunning ? 'Running' : 'Ready';
+  }
 }
 
 function handleStats(data) {
-  if (!captureActive) return;
+  if (!testRunning) return;
 
-  const elapsedMs = data.elapsed_ms || 0;
-  const entry = { time: elapsedMs, tc: {} };
-
+  // Update RX stats
   if (data.tc) {
     for (const [tc, s] of Object.entries(data.tc)) {
       const tcNum = parseInt(tc);
-      const count = s.count || 0;
-      const lastCount = lastRxCounts[tcNum] || 0;
-      const delta = Math.max(0, count - lastCount);
-      lastRxCounts[tcNum] = count;
-      entry.tc[tcNum] = delta;
-
       rxTcStats[tcNum] = {
-        count: count,
-        kbps: s.kbps || 0,
-        avgMs: s.avg_ms ? s.avg_ms : (s.avg_us ? s.avg_us / 1000 : 0),
-        burstRatio: s.burst_ratio || 0
+        count: s.count || 0,
+        kbps: s.kbps || 0
       };
+
+      // Add to packet list (simulated based on stats)
+      if (s.count > 0) {
+        const now = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
+        addPacket({
+          time: now,
+          tc: tcNum,
+          src: '192.168.100.1',
+          dst: '192.168.100.2',
+          proto: 'UDP',
+          len: 1000,
+          info: `VLAN 100, PCP ${tcNum}, ${(s.kbps || 0).toFixed(0)} kbps`
+        });
+      }
     }
   }
 
-  rxHistory.push(entry);
-  if (rxHistory.length > 200) rxHistory.shift();
-
-  const txTotal = txHistory.reduce((s, d) => s + Object.values(d.tc).reduce((a, b) => a + b, 0), 0);
-  document.getElementById('tx-count').textContent = txTotal;
-  document.getElementById('rx-count').textContent = data.total || 0;
-
-  updatePacketTables();
-  drawGraphs();
+  updateConfigUI();
+  updateCharts();
+  addThroughputSample();
+  updateResultsUI();
 }
 
-function updatePacketTables() {
-  // TX table
-  const txBody = document.getElementById('tx-pkt-body');
-  const txPktCount = document.getElementById('tx-pkt-count');
-  const totalTx = Object.values(txTcStats).reduce((s, tc) => s + tc.count, 0);
-  if (txPktCount) txPktCount.textContent = totalTx;
+function setPreset(type) {
+  const presets = {
+    low: [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000],
+    mid: [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000],
+    high: [50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000],
+    clear: [0, 0, 0, 0, 0, 0, 0, 0]
+  };
 
-  if (txBody) {
-    const tcKeys = Object.keys(txTcStats).map(Number).sort((a, b) => a - b);
-    if (tcKeys.length === 0) {
-      txBody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:16px;color:var(--text-muted)">No TX data</td></tr>';
-    } else {
-      txBody.innerHTML = tcKeys.map(tc => {
-        const s = txTcStats[tc];
-        const cfg = cbsConfig[tc] || {};
-        const bwPercent = cfg.bandwidthPercent || 0;
-        const idleSlopeKbps = (cfg.idleSlope || 0) / 1000;
-        return `
-        <tr>
-          <td><span class="tc-badge" style="background:${TC_HEX[tc]}">TC${tc}</span></td>
-          <td class="mono">${s.count}</td>
-          <td class="mono" style="color:${TC_HEX[tc]}">${bwPercent.toFixed(0)}%</td>
-          <td class="mono">${idleSlopeKbps.toFixed(0)}</td>
-        </tr>
-      `}).join('');
+  const values = presets[type];
+  if (values) {
+    for (let tc = 0; tc < 8; tc++) {
+      cbsConfig[tc].idleSlope = values[tc];
     }
-  }
-
-  // RX table
-  const rxBody = document.getElementById('rx-pkt-body');
-  const rxPktCount = document.getElementById('rx-pkt-count');
-  const totalRx = Object.values(rxTcStats).reduce((s, tc) => s + tc.count, 0);
-  const totalTxForLoss = Object.values(txTcStats).reduce((s, tc) => s + tc.count, 0);
-  const lossPercent = totalTxForLoss > 0 ? ((totalTxForLoss - totalRx) / totalTxForLoss * 100) : 0;
-  if (rxPktCount) {
-    rxPktCount.textContent = `${totalRx}`;
-    if (totalTxForLoss > 0 && lossPercent > 1) {
-      rxPktCount.textContent += ` (${lossPercent.toFixed(1)}% loss)`;
-    }
-  }
-
-  if (rxBody) {
-    const tcKeys = Object.keys(rxTcStats).map(Number).sort((a, b) => a - b);
-    if (tcKeys.length === 0) {
-      rxBody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:16px;color:var(--text-muted)">No RX packets</td></tr>';
-    } else {
-      rxBody.innerHTML = tcKeys.map(tc => {
-        const s = rxTcStats[tc];
-        // Detect shaping based on burst ratio or estimated config
-        const isConfigured = cbsConfig[tc].enabled && cbsConfig[tc].idleSlope > 0;
-        return `
-        <tr>
-          <td><span class="tc-badge" style="background:${TC_HEX[tc]}">TC${tc}</span></td>
-          <td class="mono">${s.count}</td>
-          <td class="mono">${s.kbps.toFixed(1)}</td>
-          <td>${isConfigured ? '<span style="color:var(--success)">CBS</span>' : '-'}</td>
-        </tr>
-      `}).join('');
-    }
+    updateConfigUI();
+    updateCharts();
   }
 }
 
-function drawGraphs() {
-  drawSlopeGraph('slope-canvas');
-  drawPacketGraph('tx-canvas', txHistory);
-  drawPacketGraph('rx-canvas', rxHistory);
-}
-
-// Draw Idle Slope comparison bar graph (Config vs Measured)
-function drawSlopeGraph(canvasId) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
-
-  const ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = canvas.offsetWidth * dpr;
-  canvas.height = 140 * dpr;
-  ctx.scale(dpr, dpr);
-
-  const displayW = canvas.offsetWidth;
-  const displayH = 140;
-  const pad = { top: 16, right: 8, bottom: 20, left: 28 };
-  const chartW = displayW - pad.left - pad.right;
-  const chartH = displayH - pad.top - pad.bottom;
-
-  ctx.clearRect(0, 0, displayW, displayH);
-  ctx.fillStyle = '#f8fafc';
-  ctx.fillRect(0, 0, displayW, displayH);
-
-  const maxBW = 30;  // Max 30% bandwidth
-  const barGroupWidth = chartW / 8;
-  const barWidth = barGroupWidth * 0.35;
-
-  // Y axis lines
-  for (let bw = 0; bw <= maxBW; bw += 10) {
-    const y = pad.top + chartH - (bw / maxBW) * chartH;
-    ctx.strokeStyle = '#e2e8f0';
-    ctx.lineWidth = 0.5;
-    ctx.beginPath();
-    ctx.moveTo(pad.left, y);
-    ctx.lineTo(pad.left + chartW, y);
-    ctx.stroke();
-
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '7px sans-serif';
-    ctx.textAlign = 'right';
-    ctx.fillText(bw + '%', pad.left - 3, y + 3);
-  }
-
-  // Draw bars for each TC
-  for (let tc = 0; tc < 8; tc++) {
-    const cfg = cbsConfig[tc] || {};
-    const configBW = cfg.bandwidthPercent || 0;
-    const measuredBW = cfg.measuredPercent || 0;
-    const x = pad.left + tc * barGroupWidth + barGroupWidth * 0.15;
-
-    // Config bar (left, darker)
-    const configH = Math.min(configBW / maxBW, 1) * chartH;
-    ctx.fillStyle = TC_HEX[tc];
-    ctx.fillRect(x, pad.top + chartH - configH, barWidth, configH);
-
-    // Measured bar (right, lighter with border)
-    if (measuredBW > 0) {
-      const measuredH = Math.min(measuredBW / maxBW, 1) * chartH;
-      ctx.fillStyle = TC_HEX[tc] + '60';
-      ctx.strokeStyle = TC_HEX[tc];
-      ctx.lineWidth = 1;
-      ctx.fillRect(x + barWidth + 2, pad.top + chartH - measuredH, barWidth, measuredH);
-      ctx.strokeRect(x + barWidth + 2, pad.top + chartH - measuredH, barWidth, measuredH);
-    }
-
-    // TC label
-    ctx.fillStyle = selectedTCs.includes(tc) ? TC_HEX[tc] : '#94a3b8';
-    ctx.font = '8px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(tc, x + barWidth, displayH - 5);
-  }
-
-  // Legend
-  ctx.font = '7px sans-serif';
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#64748b';
-  ctx.fillRect(pad.left + 2, 3, 8, 8);
-  ctx.fillStyle = '#333';
-  ctx.fillText('Config', pad.left + 14, 10);
-  ctx.fillStyle = '#64748b80';
-  ctx.fillRect(pad.left + 50, 3, 8, 8);
-  ctx.strokeStyle = '#64748b';
-  ctx.strokeRect(pad.left + 50, 3, 8, 8);
-  ctx.fillStyle = '#333';
-  ctx.fillText('Measured', pad.left + 62, 10);
-}
-
-// Draw packet raster graph with 1px lines
-function drawPacketGraph(canvasId, data) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
-
-  const ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = canvas.offsetWidth * dpr;
-  canvas.height = 140 * dpr;
-  ctx.scale(dpr, dpr);
-
-  const displayW = canvas.offsetWidth;
-  const displayH = 140;
-  const pad = { top: 6, right: 4, bottom: 16, left: 20 };
-  const chartW = displayW - pad.left - pad.right;
-  const chartH = displayH - pad.top - pad.bottom;
-  const rowH = chartH / 8;
-
-  ctx.clearRect(0, 0, displayW, displayH);
-  ctx.fillStyle = '#f8fafc';
-  ctx.fillRect(0, 0, displayW, displayH);
-
-  const maxTime = 8000;
-
-  // TC rows (minimal)
-  for (let tc = 0; tc < 8; tc++) {
-    const y = pad.top + tc * rowH;
-    ctx.fillStyle = selectedTCs.includes(tc) ? TC_HEX[tc] + '08' : '#fff';
-    ctx.fillRect(pad.left, y, chartW, rowH);
-    ctx.strokeStyle = '#f1f5f9';
-    ctx.lineWidth = 0.5;
-    ctx.beginPath();
-    ctx.moveTo(pad.left, y + rowH);
-    ctx.lineTo(pad.left + chartW, y + rowH);
-    ctx.stroke();
-
-    // TC number
-    ctx.fillStyle = selectedTCs.includes(tc) ? TC_HEX[tc] : '#cbd5e1';
-    ctx.font = '7px sans-serif';
-    ctx.textAlign = 'right';
-    ctx.fillText(tc, pad.left - 2, y + rowH / 2 + 2);
-  }
-
-  // X axis (minimal)
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '6px sans-serif';
-  ctx.textAlign = 'center';
-  for (let t = 0; t <= maxTime; t += 2000) {
-    const x = pad.left + (t / maxTime) * chartW;
-    ctx.fillText((t / 1000) + 's', x, displayH - 3);
-  }
-
-  // Draw packets as 1px vertical lines
-  data.forEach(d => {
-    const x = Math.floor(pad.left + (d.time / maxTime) * chartW);
-    [0,1,2,3,4,5,6,7].forEach(tc => {
-      const count = d.tc[tc] || 0;
-      if (count === 0) return;
-      const y = pad.top + tc * rowH;
-
-      // 1px line
-      ctx.strokeStyle = TC_HEX[tc];
-      ctx.lineWidth = 1;
-      ctx.globalAlpha = Math.min(0.4 + count * 0.1, 1);
-      ctx.beginPath();
-      ctx.moveTo(x + 0.5, y + 1);
-      ctx.lineTo(x + 0.5, y + rowH - 1);
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-    });
+function setupEvents() {
+  // Port select
+  document.getElementById('port-select')?.addEventListener('change', async (e) => {
+    currentPort = e.target.value;
+    await loadStatus();
   });
 
-  // Border
-  ctx.strokeStyle = '#e2e8f0';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(pad.left, pad.top, chartW, chartH);
+  // Config inputs
+  document.getElementById('config-body')?.addEventListener('input', (e) => {
+    if (e.target.classList.contains('slope-input')) {
+      const tc = parseInt(e.target.dataset.tc);
+      cbsConfig[tc].idleSlope = parseInt(e.target.value) || 0;
+      updateConfigUI();
+      updateCharts();
+    }
+  });
+
+  // Buttons
+  document.getElementById('apply-btn')?.addEventListener('click', applyConfig);
+  document.getElementById('load-device-btn')?.addEventListener('click', loadStatus);
+  document.getElementById('start-btn')?.addEventListener('click', startTest);
+  document.getElementById('stop-btn')?.addEventListener('click', stopTest);
+  document.getElementById('clear-pkts')?.addEventListener('click', () => {
+    packetList = [];
+    renderPacketList();
+  });
+  document.getElementById('analyze-btn')?.addEventListener('click', updateResultsUI);
+
+  // Presets
+  document.querySelector('.preset-row')?.addEventListener('click', (e) => {
+    const preset = e.target.dataset?.preset;
+    if (preset) setPreset(preset);
+  });
+
+  // TC selection
+  document.querySelector('.tc-buttons')?.addEventListener('click', (e) => {
+    if (e.target.classList.contains('tc-btn')) {
+      const tc = parseInt(e.target.dataset.tc);
+      const idx = selectedTCs.indexOf(tc);
+      if (idx > -1) {
+        selectedTCs.splice(idx, 1);
+        e.target.classList.remove('active');
+      } else {
+        selectedTCs.push(tc);
+        selectedTCs.sort((a, b) => a - b);
+        e.target.classList.add('active');
+      }
+    }
+  });
+
+  // Export packets
+  document.getElementById('export-pkts')?.addEventListener('click', () => {
+    const csv = 'No,Time,TC,Source,Destination,Protocol,Length,Info\n' +
+      packetList.map((p, i) => `${i + 1},${p.time},${p.tc},${p.src},${p.dst},${p.proto},${p.len},"${p.info}"`).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `cbs-capture-${Date.now()}.csv`;
+    a.click();
+  });
 }
 
+let statsHandler = null;
+let stopHandler = null;
+
+export async function init(appState, deps) {
+  state = appState;
+  api = deps.api;
+  ws = deps.ws;
+
+  setupEvents();
+  await loadInterfaces();
+  await loadStatus();
+
+  // Initialize charts after DOM is ready
+  setTimeout(initCharts, 200);
+
+  // WebSocket handlers
+  if (ws) {
+    statsHandler = handleStats;
+    stopHandler = () => { if (testRunning) stopTest(); };
+    ws.on('c-capture-stats', statsHandler);
+    ws.on('c-capture-stopped', stopHandler);
+  }
+
+  // Auto refresh
+  refreshTimer = setInterval(loadStatus, 10000);
+}
+
+export function cleanup() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+  if (ws) {
+    if (statsHandler) ws.off('c-capture-stats', statsHandler);
+    if (stopHandler) ws.off('c-capture-stopped', stopHandler);
+  }
+  if (bandwidthChart) { bandwidthChart.destroy(); bandwidthChart = null; }
+  if (throughputChart) { throughputChart.destroy(); throughputChart = null; }
+  testRunning = false;
+}
