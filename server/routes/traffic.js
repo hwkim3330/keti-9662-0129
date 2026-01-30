@@ -1,460 +1,263 @@
 import express from 'express';
-import Cap from 'cap';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
-const { Cap: CapLib } = Cap;
 
-// Active C sender process
-let cSenderProcess = null;
-
-// Active traffic generators
-const generators = new Map();
-
-// Build Ethernet frame with optional VLAN tag
-function buildFrame(options) {
-  const {
-    dstMac,
-    srcMac,
-    vlanId = 0,
-    pcp = 0,
-    etherType = 0x0800, // IPv4
-    payloadSize = 64
-  } = options;
-
-  // Parse MAC addresses
-  const parseMac = (mac) => {
-    return Buffer.from(mac.replace(/[:-]/g, ''), 'hex');
-  };
-
-  const dstMacBuf = parseMac(dstMac);
-  const srcMacBuf = parseMac(srcMac);
-
-  let frame;
-  let headerSize;
-
-  if (vlanId > 0) {
-    // 802.1Q tagged frame
-    // Dst(6) + Src(6) + TPID(2) + TCI(2) + EtherType(2) = 18 bytes header
-    headerSize = 18;
-    const totalSize = Math.max(headerSize + payloadSize, 64); // Min 64 bytes
-    frame = Buffer.alloc(totalSize);
-
-    let offset = 0;
-    dstMacBuf.copy(frame, offset); offset += 6;
-    srcMacBuf.copy(frame, offset); offset += 6;
-
-    // TPID (802.1Q tag)
-    frame.writeUInt16BE(0x8100, offset); offset += 2;
-
-    // TCI: PCP(3) + DEI(1) + VID(12)
-    const tci = ((pcp & 0x07) << 13) | (vlanId & 0x0FFF);
-    frame.writeUInt16BE(tci, offset); offset += 2;
-
-    // EtherType
-    frame.writeUInt16BE(etherType, offset); offset += 2;
-
-    // Fill payload with pattern
-    for (let i = offset; i < totalSize; i++) {
-      frame[i] = i & 0xFF;
-    }
-  } else {
-    // Untagged frame
-    // Dst(6) + Src(6) + EtherType(2) = 14 bytes header
-    headerSize = 14;
-    const totalSize = Math.max(headerSize + payloadSize, 64);
-    frame = Buffer.alloc(totalSize);
-
-    let offset = 0;
-    dstMacBuf.copy(frame, offset); offset += 6;
-    srcMacBuf.copy(frame, offset); offset += 6;
-    frame.writeUInt16BE(etherType, offset); offset += 2;
-
-    // Fill payload with pattern
-    for (let i = offset; i < totalSize; i++) {
-      frame[i] = i & 0xFF;
-    }
-  }
-
-  return frame;
-}
+// Active txgen process
+let txgenProcess = null;
+let txgenStats = null;
 
 // Get interface MAC address
 function getInterfaceMac(ifaceName) {
-  // Try reading from /sys/class/net first (most reliable for Linux)
   try {
     const macPath = `/sys/class/net/${ifaceName}/address`;
     if (fs.existsSync(macPath)) {
       return fs.readFileSync(macPath, 'utf8').trim();
     }
   } catch (e) {}
-
-  // Fallback to libpcap device list
-  const devices = CapLib.deviceList();
-  const device = devices.find(d => d.name === ifaceName);
-  if (device && device.addresses) {
-    for (const addr of device.addresses) {
-      if (addr.addr && addr.addr.includes(':') && addr.addr.length === 17) {
-        return addr.addr;
-      }
-    }
-  }
   return '00:00:00:00:00:00';
+}
+
+// Get interface IP address
+function getInterfaceIP(ifaceName) {
+  try {
+    const result = execSync(`ip -4 addr show ${ifaceName} | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'`, { encoding: 'utf8' });
+    return result.trim().split('\n')[0] || '10.0.0.1';
+  } catch (e) {
+    return '10.0.0.1';  // Fallback dummy IP
+  }
 }
 
 // Get available interfaces
 router.get('/interfaces', (req, res) => {
   try {
-    const devices = CapLib.deviceList();
-    const interfaces = devices
-      .filter(d => d.name && !d.name.startsWith('any') && !d.name.startsWith('nf') && !d.name.startsWith('dbus'))
-      .map(d => ({
-        name: d.name,
-        description: d.description || d.name,
-        addresses: d.addresses?.map(a => a.addr).filter(Boolean) || []
-      }));
-    res.json(interfaces);
+    const ifaces = fs.readdirSync('/sys/class/net')
+      .filter(name => !name.startsWith('lo') && !name.startsWith('docker') && !name.startsWith('veth'))
+      .map(name => {
+        const mac = getInterfaceMac(name);
+        const ip = getInterfaceIP(name);
+        return { name, addresses: [mac, ip].filter(Boolean) };
+      });
+    res.json(ifaces);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Start traffic generation
-router.post('/start', (req, res) => {
-  const {
-    interface: ifaceName,
-    dstMac,
-    srcMac,
-    vlanId = 0,
-    pcp = 0,  // Can be single number or array
-    pcpList,  // Alternative: array of PCPs to send
-    packetSize = 100,
-    packetsPerSecond = 100,
-    duration = 0, // 0 = unlimited
-    count = 0 // 0 = unlimited (use duration)
-  } = req.body;
-
-  if (!ifaceName) {
-    return res.status(400).json({ error: 'Interface name required' });
-  }
-
-  if (!dstMac) {
-    return res.status(400).json({ error: 'Destination MAC required' });
-  }
-
-  // Use interface+pcp as key to allow multiple TCs on same interface
-  const pcpValue = parseInt(pcp) || 0;
-  const generatorKey = `${ifaceName}:${pcpValue}`;
-
-  if (generators.has(generatorKey)) {
-    return res.status(400).json({ error: `Generator already running for ${generatorKey}` });
-  }
-
-  try {
-    const cap = new CapLib();
-    const buffer = Buffer.alloc(65535);
-    const linkType = cap.open(ifaceName, '', 10 * 1024 * 1024, buffer);
-
-    if (linkType !== 'ETHERNET') {
-      cap.close();
-      return res.status(400).json({ error: `Interface ${ifaceName} is not Ethernet` });
-    }
-
-    // Get source MAC if not provided
-    const sourceMac = srcMac || getInterfaceMac(ifaceName);
-
-    // Build the frame
-    const frame = buildFrame({
-      dstMac,
-      srcMac: sourceMac,
-      vlanId: parseInt(vlanId) || 0,
-      pcp: pcpValue,
-      payloadSize: Math.max(46, parseInt(packetSize) - 18) // Min payload for 64 byte frame
-    });
-
-    const pps = Math.max(1, Math.min(100000, parseInt(packetsPerSecond) || 100));
-
-    // For high PPS, use burst mode (send multiple packets per interval)
-    // setInterval has ~1ms minimum resolution, so for >1000 pps we need bursts
-    const intervalMs = pps > 1000 ? 1 : Math.max(1, Math.floor(1000 / pps));
-    const packetsPerBurst = pps > 1000 ? Math.ceil(pps / 1000) : 1;
-
-    const stats = {
-      sent: 0,
-      errors: 0,
-      bytes: 0,
-      startTime: Date.now(),
-      running: true
-    };
-
-    const maxPackets = parseInt(count) || 0;
-    const maxDuration = (parseInt(duration) || 0) * 1000; // Convert to ms
-
-    // Send packets at specified rate (with burst support)
-    const sendPacket = () => {
-      if (!stats.running) return;
-
-      // Check limits
-      if (maxPackets > 0 && stats.sent >= maxPackets) {
-        stopGenerator(generatorKey);
-        return;
-      }
-
-      if (maxDuration > 0 && (Date.now() - stats.startTime) >= maxDuration) {
-        stopGenerator(generatorKey);
-        return;
-      }
-
-      // Send burst of packets
-      for (let i = 0; i < packetsPerBurst; i++) {
-        try {
-          cap.send(frame, frame.length);
-          stats.sent++;
-          stats.bytes += frame.length;
-        } catch (err) {
-          stats.errors++;
-        }
-      }
-    };
-
-    // Use setInterval for rate control
-    const timer = setInterval(sendPacket, intervalMs);
-
-    generators.set(generatorKey, {
-      cap,
-      timer,
-      stats,
-      ifaceName,
-      config: { dstMac, srcMac: sourceMac, vlanId, pcp: pcpValue, packetSize: frame.length, packetsPerSecond: pps, packetsPerBurst }
-    });
-
-    res.json({
-      success: true,
-      message: `Traffic generator started: ${generatorKey}`,
-      generatorKey,
-      config: {
-        interface: ifaceName,
-        dstMac,
-        srcMac: sourceMac,
-        vlanId,
-        pcp: pcpValue,
-        packetSize: frame.length,
-        packetsPerSecond: pps,
-        duration: duration || 'unlimited',
-        count: count || 'unlimited'
-      }
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Stop generator helper
-function stopGenerator(generatorKey) {
-  const gen = generators.get(generatorKey);
-  if (gen) {
-    gen.stats.running = false;
-    clearInterval(gen.timer);
-    try {
-      gen.cap.close();
-    } catch (e) {}
-    generators.delete(generatorKey);
-    return gen.stats;
-  }
-  return null;
-}
-
-// Stop traffic generation
-router.post('/stop', (req, res) => {
-  const { interface: ifaceName, pcp, generatorKey } = req.body;
-
-  if (generatorKey) {
-    // Stop specific generator by key
-    const stats = stopGenerator(generatorKey);
-    if (stats) {
-      res.json({
-        success: true,
-        message: `Traffic generator stopped: ${generatorKey}`,
-        stats: { sent: stats.sent, errors: stats.errors, duration: Date.now() - stats.startTime }
-      });
-    } else {
-      res.status(404).json({ error: `No generator: ${generatorKey}` });
-    }
-  } else if (ifaceName) {
-    // Stop all generators for this interface (any PCP)
-    const results = [];
-    for (const [key, gen] of generators) {
-      if (key.startsWith(ifaceName + ':')) {
-        const stats = stopGenerator(key);
-        results.push({
-          generatorKey: key,
-          sent: stats.sent,
-          errors: stats.errors,
-          duration: Date.now() - stats.startTime
-        });
-      }
-    }
-    if (results.length > 0) {
-      res.json({ success: true, message: `Stopped ${results.length} generator(s) on ${ifaceName}`, stopped: results });
-    } else {
-      res.status(404).json({ error: `No generators running on ${ifaceName}` });
-    }
-  } else {
-    // Stop all
-    const results = [];
-    for (const [key, gen] of generators) {
-      const stats = stopGenerator(key);
-      results.push({
-        generatorKey: key,
-        sent: stats.sent,
-        errors: stats.errors,
-        duration: Date.now() - stats.startTime
-      });
-    }
-    res.json({ success: true, stopped: results });
-  }
-});
-
-// Get status
-router.get('/status', (req, res) => {
-  const status = [];
-  for (const [name, gen] of generators) {
-    status.push({
-      interface: name,
-      running: gen.stats.running,
-      sent: gen.stats.sent,
-      errors: gen.stats.errors,
-      duration: Date.now() - gen.stats.startTime,
-      config: gen.config
-    });
-  }
-  res.json({
-    active: generators.size,
-    generators: status
-  });
-});
-
-// Start precision traffic using C sender
+// Start traffic generation using txgen
 router.post('/start-precision', (req, res) => {
   const {
     interface: ifaceName,
     dstMac,
+    dstIp,
     srcMac,
     vlanId = 100,
-    tcList = [1, 2, 3, 4, 5, 6, 7],
-    packetsPerSecond = 100,
-    duration = 7,
-    frameSize = 1000  // Default 1000 bytes for ~8Mbps per TC at 1000 pps
+    tcList = [0, 1, 2, 3, 4, 5, 6, 7],
+    packetsPerSecond = 1000,
+    duration = 10,
+    frameSize = 1000
   } = req.body;
 
-  if (!ifaceName || !dstMac) {
-    return res.status(400).json({ error: 'Interface and dstMac required' });
+  if (!ifaceName) {
+    return res.status(400).json({ error: 'Interface required' });
   }
 
-  // Stop existing C sender if running
-  if (cSenderProcess) {
+  // Stop existing txgen if running
+  if (txgenProcess) {
     try {
-      cSenderProcess.kill('SIGTERM');
+      txgenProcess.kill('SIGTERM');
     } catch (e) {}
-    cSenderProcess = null;
+    txgenProcess = null;
   }
 
-  // Get source MAC if not provided
+  // Get MAC addresses
   const sourceMac = srcMac || getInterfaceMac(ifaceName);
 
-  // Build TC list string
-  const tcListStr = Array.isArray(tcList) ? tcList.join(',') : String(tcList);
+  // Destination IP - use provided or generate from MAC (last 4 bytes as IP)
+  let destIp = dstIp;
+  if (!destIp && dstMac) {
+    // Generate dummy IP from MAC for Layer 2 testing
+    const macParts = dstMac.split(':').map(h => parseInt(h, 16));
+    destIp = `10.${macParts[3] || 0}.${macParts[4] || 0}.${macParts[5] || 1}`;
+  }
+  if (!destIp) destIp = '10.0.0.2';
 
-  // Path to C binary
-  const senderPath = path.join(__dirname, '..', 'traffic-sender');
+  // Calculate rate in Mbps from pps and frame size
+  // Total rate = pps * frameSize * 8 bits / 1,000,000
+  const tcArray = Array.isArray(tcList) ? tcList : [parseInt(tcList) || 0];
+  const totalRateMbps = Math.ceil((packetsPerSecond * frameSize * 8) / 1000000);
+
+  // Build txgen arguments for multi-TC mode
+  // --multi-tc format: "pcp1,pcp2,...:vlanId" sends traffic with all specified PCPs
+  const tcListStr = tcArray.join(',');
+  const multiTcSpec = `${tcListStr}:${vlanId}`;
+
+  const txgenPath = path.join(__dirname, '..', 'txgen');
 
   const args = [
     ifaceName,
-    dstMac,
-    sourceMac,
-    String(vlanId),
-    tcListStr,
-    String(packetsPerSecond),
-    String(duration),
-    String(frameSize)
+    '-B', destIp,
+    '-b', dstMac || 'ff:ff:ff:ff:ff:ff',
+    '-a', sourceMac,
+    '--multi-tc', multiTcSpec,
+    '-r', String(totalRateMbps),
+    '-l', String(frameSize),  // Packet length
+    '--seq',
+    '--timestamp',
+    '--duration', String(duration)
   ];
 
-  console.log(`Starting C sender: ${senderPath} ${args.join(' ')}`);
+  console.log(`[txgen] Starting: ${txgenPath} ${args.join(' ')}`);
 
   try {
-    // Binary has CAP_NET_RAW capability, no sudo needed
-    cSenderProcess = spawn(senderPath, args, {
-      stdio: ['ignore', 'pipe', 'pipe']
+    txgenStats = {
+      startTime: Date.now(),
+      interface: ifaceName,
+      tcList: tcArray,
+      vlanId,
+      pps: packetsPerSecond,
+      rateMbps: totalRateMbps,
+      duration,
+      frameSize,
+      sent: 0,
+      errors: 0
+    };
+
+    // Use sudo for raw socket access
+    const sudoArgs = ['-S', txgenPath, ...args];
+    txgenProcess = spawn('sudo', sudoArgs, {
+      stdio: ['pipe', 'pipe', 'pipe']
     });
+    // Send sudo password
+    txgenProcess.stdin.write('1\n');
+    txgenProcess.stdin.end();
 
     let stdout = '';
     let stderr = '';
 
-    cSenderProcess.stdout.on('data', (data) => {
+    txgenProcess.stdout.on('data', (data) => {
       stdout += data.toString();
-    });
-
-    cSenderProcess.stderr.on('data', (data) => {
-      stderr += data.toString();
-      console.log('C sender:', data.toString().trim());
-    });
-
-    cSenderProcess.on('close', (code) => {
-      console.log(`C sender exited with code ${code}`);
-      cSenderProcess = null;
-
-      // Try to parse JSON result
-      try {
-        if (stdout.trim()) {
-          const result = JSON.parse(stdout.trim());
-          console.log('C sender result:', result);
+      // Parse txgen output for stats
+      const lines = data.toString().split('\n');
+      for (const line of lines) {
+        // txgen prints stats like: "TX: 10000 pkts, 10.5 Mbps, 0 errors"
+        const match = line.match(/TX:\s*(\d+)\s*pkts.*?(\d+)\s*errors/i);
+        if (match) {
+          txgenStats.sent = parseInt(match[1]);
+          txgenStats.errors = parseInt(match[2]);
         }
-      } catch (e) {
-        console.log('C sender output:', stdout);
       }
     });
 
-    cSenderProcess.on('error', (err) => {
-      console.error('C sender error:', err);
-      cSenderProcess = null;
+    txgenProcess.stderr.on('data', (data) => {
+      stderr += data.toString();
+      console.log('[txgen]', data.toString().trim());
+    });
+
+    txgenProcess.on('close', (code) => {
+      console.log(`[txgen] Process exited with code ${code}`);
+      txgenProcess = null;
+    });
+
+    txgenProcess.on('error', (err) => {
+      console.error('[txgen] Error:', err.message);
+      txgenProcess = null;
     });
 
     res.json({
       success: true,
-      message: 'Precision traffic generator started (C)',
+      message: 'Traffic generator started (txgen)',
       config: {
         interface: ifaceName,
-        dstMac,
+        dstMac: dstMac || 'ff:ff:ff:ff:ff:ff',
+        dstIp: destIp,
         srcMac: sourceMac,
         vlanId,
-        tcList,
+        tcList: tcArray,
         packetsPerSecond,
+        rateMbps: totalRateMbps,
         duration,
         frameSize
       }
     });
   } catch (err) {
+    txgenProcess = null;
     res.status(500).json({ error: err.message });
   }
 });
 
-// Stop precision traffic (C sender)
+// Stop txgen
 router.post('/stop-precision', (req, res) => {
-  if (cSenderProcess) {
+  if (txgenProcess) {
     try {
-      cSenderProcess.kill('SIGTERM');
-      spawn('pkill', ['-f', 'traffic-sender'], { stdio: 'ignore' });
+      txgenProcess.kill('SIGTERM');
+      // Also try to kill any orphan txgen processes
+      spawn('pkill', ['-f', 'txgen'], { stdio: 'ignore' });
     } catch (e) {}
-    cSenderProcess = null;
-    res.json({ success: true, message: 'Precision traffic stopped' });
+    txgenProcess = null;
+    res.json({ success: true, message: 'txgen stopped', stats: txgenStats });
   } else {
-    spawn('pkill', ['-f', 'traffic-sender'], { stdio: 'ignore' });
-    res.json({ success: true, message: 'No active precision traffic' });
+    spawn('pkill', ['-f', 'txgen'], { stdio: 'ignore' });
+    res.json({ success: true, message: 'No active txgen' });
   }
+});
+
+// Legacy endpoints for compatibility
+router.post('/start', (req, res) => {
+  // Redirect to precision endpoint
+  const {
+    interface: ifaceName,
+    dstMac,
+    srcMac,
+    vlanId = 0,
+    pcp = 0,
+    packetSize = 100,
+    packetsPerSecond = 100,
+    duration = 0
+  } = req.body;
+
+  // Forward to start-precision with single TC
+  req.body = {
+    interface: ifaceName,
+    dstMac,
+    srcMac,
+    vlanId: vlanId || 100,
+    tcList: [parseInt(pcp) || 0],
+    packetsPerSecond,
+    duration: duration || 10,
+    frameSize: packetSize
+  };
+
+  // Call start-precision handler
+  return router.handle(req, res, () => {});
+});
+
+router.post('/stop', (req, res) => {
+  // Stop all traffic
+  if (txgenProcess) {
+    try {
+      txgenProcess.kill('SIGTERM');
+    } catch (e) {}
+    txgenProcess = null;
+  }
+  spawn('pkill', ['-f', 'txgen'], { stdio: 'ignore' });
+  res.json({ success: true, stopped: [] });
+});
+
+// Get status
+router.get('/status', (req, res) => {
+  res.json({
+    active: txgenProcess ? 1 : 0,
+    generators: txgenProcess ? [{
+      type: 'txgen',
+      running: true,
+      stats: txgenStats
+    }] : []
+  });
 });
 
 // Send single packet (for testing)
@@ -462,38 +265,40 @@ router.post('/send', (req, res) => {
   const {
     interface: ifaceName,
     dstMac,
+    dstIp,
     srcMac,
     vlanId = 0,
     pcp = 0,
     packetSize = 100
   } = req.body;
 
-  if (!ifaceName || !dstMac) {
-    return res.status(400).json({ error: 'Interface and dstMac required' });
+  if (!ifaceName) {
+    return res.status(400).json({ error: 'Interface required' });
+  }
+
+  const txgenPath = path.join(__dirname, '..', 'txgen');
+  const sourceMac = srcMac || getInterfaceMac(ifaceName);
+  const destIp = dstIp || '10.0.0.2';
+
+  const args = [
+    ifaceName,
+    '-B', destIp,
+    '-b', dstMac || 'ff:ff:ff:ff:ff:ff',
+    '-a', sourceMac,
+    '-c', '1',  // Single packet
+    '-s', String(packetSize)
+  ];
+
+  if (vlanId > 0) {
+    args.push('-Q', `${pcp}:${vlanId}`);
   }
 
   try {
-    const cap = new CapLib();
-    const buffer = Buffer.alloc(65535);
-    cap.open(ifaceName, '', 10 * 1024 * 1024, buffer);
-
-    const sourceMac = srcMac || getInterfaceMac(ifaceName);
-    const frame = buildFrame({
-      dstMac,
-      srcMac: sourceMac,
-      vlanId: parseInt(vlanId) || 0,
-      pcp: parseInt(pcp) || 0,
-      payloadSize: Math.max(46, parseInt(packetSize) - 18)
-    });
-
-    cap.send(frame, frame.length);
-    cap.close();
-
+    const result = execSync(`${txgenPath} ${args.join(' ')}`, { encoding: 'utf8', timeout: 5000 });
     res.json({
       success: true,
       message: 'Packet sent',
-      frameSize: frame.length,
-      frameHex: frame.toString('hex').match(/.{2}/g).join(' ').substring(0, 100) + '...'
+      output: result.trim()
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

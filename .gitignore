@@ -6,6 +6,10 @@ dist/
 build/
 client/dist/
 
+# Traffic generator binaries (build from traffic-generator repo)
+server/txgen
+server/rxcap
+
 # Logs
 logs
 *.log

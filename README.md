@@ -190,17 +190,36 @@ npm start            # 서버 실행 (http://localhost:3000)
 - [컴포넌트](docs/COMPONENTS.md) - UI 컴포넌트 가이드
 - [PTP 추정](docs/PTP-ESTIMATION.md) - PTP Offset 추정 알고리즘
 
+## Traffic Generator Setup
+
+CBS 대시보드의 트래픽 생성/캡처 기능을 사용하려면 txgen/rxcap 바이너리를 빌드해야 합니다:
+
+```bash
+# 1. traffic-generator 저장소 클론
+git clone https://github.com/hwkim3330/traffic-generator.git
+cd traffic-generator
+
+# 2. 빌드
+make
+
+# 3. 바이너리를 server 디렉토리에 복사
+cp txgen rxcap /path/to/keti-9662-0129/server/
+
+# 4. CAP_NET_RAW capability 설정 (선택사항 - sudo 없이 실행시)
+sudo setcap cap_net_raw=eip server/txgen
+sudo setcap cap_net_raw=eip server/rxcap
+```
+
 ## Requirements
 
 - Node.js 18+
 - npm 9+
-- libpcap (패킷 캡처용)
+- GCC (traffic generator 빌드용)
 
 ### Linux (Ubuntu/Debian)
 
 ```bash
-sudo apt install libpcap-dev
-```
+sudo apt install build-essential
 
 ### macOS
 
