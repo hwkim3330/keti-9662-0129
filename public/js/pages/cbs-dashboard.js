@@ -20,9 +20,10 @@ let throughputChart = null;
 // Data
 let rxTcStats = {};
 let txTcStats = {};
-let packetList = [];
+let txPacketList = [];
+let rxPacketList = [];
 let throughputHistory = [];
-const MAX_PACKETS = 200;
+const MAX_PACKETS = 100;
 const MAX_HISTORY = 60;
 
 // Link speed (1 Gbps)
@@ -48,9 +49,6 @@ export function render(appState) {
   state = appState;
 
   return `
-    <!-- Chart.js CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-
     <div class="cbs-dashboard">
       <!-- Header -->
       <div class="dash-header">
@@ -172,32 +170,57 @@ export function render(appState) {
         </div>
       </div>
 
-      <!-- Packet List (Wireshark style) -->
-      <div class="panel packet-panel">
-        <div class="panel-header">
-          <h2>Packet Capture</h2>
-          <div class="panel-actions">
-            <span class="pkt-count" id="pkt-count">0 packets</span>
-            <button class="btn btn-xs" id="clear-pkts">Clear</button>
-            <button class="btn btn-xs" id="export-pkts">Export CSV</button>
+      <!-- Packet Capture (TX/RX split) -->
+      <div class="packet-grid">
+        <!-- TX Packets -->
+        <div class="panel packet-panel tx-panel">
+          <div class="panel-header">
+            <h2><span class="tx-badge">TX</span> Transmitted Packets</h2>
+            <div class="panel-actions">
+              <span class="pkt-count" id="tx-pkt-count">0 packets</span>
+              <button class="btn btn-xs" id="clear-tx-pkts">Clear</button>
+            </div>
+          </div>
+          <div class="packet-list-container">
+            <table class="packet-list">
+              <thead>
+                <tr>
+                  <th class="col-no">No.</th>
+                  <th class="col-time">Time</th>
+                  <th class="col-tc">TC</th>
+                  <th class="col-len">Length</th>
+                  <th class="col-info">Info</th>
+                </tr>
+              </thead>
+              <tbody id="tx-packet-body"></tbody>
+            </table>
           </div>
         </div>
-        <div class="packet-list-container">
-          <table class="packet-list">
-            <thead>
-              <tr>
-                <th class="col-no">No.</th>
-                <th class="col-time">Time</th>
-                <th class="col-tc">TC</th>
-                <th class="col-src">Source</th>
-                <th class="col-dst">Destination</th>
-                <th class="col-proto">Protocol</th>
-                <th class="col-len">Length</th>
-                <th class="col-info">Info</th>
-              </tr>
-            </thead>
-            <tbody id="packet-body"></tbody>
-          </table>
+
+        <!-- RX Packets -->
+        <div class="panel packet-panel rx-panel">
+          <div class="panel-header">
+            <h2><span class="rx-badge">RX</span> Received Packets</h2>
+            <div class="panel-actions">
+              <span class="pkt-count" id="rx-pkt-count">0 packets</span>
+              <button class="btn btn-xs" id="clear-rx-pkts">Clear</button>
+              <button class="btn btn-xs" id="export-pkts">Export CSV</button>
+            </div>
+          </div>
+          <div class="packet-list-container">
+            <table class="packet-list">
+              <thead>
+                <tr>
+                  <th class="col-no">No.</th>
+                  <th class="col-time">Time</th>
+                  <th class="col-tc">TC</th>
+                  <th class="col-len">Length</th>
+                  <th class="col-info">Info</th>
+                </tr>
+              </thead>
+              <tbody id="rx-packet-body"></tbody>
+            </table>
+          </div>
         </div>
       </div>
 
@@ -494,13 +517,43 @@ export function render(appState) {
         color: #9ca3af;
       }
 
+      /* Packet Grid (TX/RX Split) */
+      .packet-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin-bottom: 16px;
+      }
+      .tx-badge, .rx-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 700;
+        margin-right: 8px;
+      }
+      .tx-badge {
+        background: linear-gradient(135deg, #f97316, #ea580c);
+        color: white;
+      }
+      .rx-badge {
+        background: linear-gradient(135deg, #22c55e, #16a34a);
+        color: white;
+      }
+      .tx-panel .packet-list th {
+        border-bottom-color: #f97316;
+      }
+      .rx-panel .packet-list th {
+        border-bottom-color: #22c55e;
+      }
+
       /* Packet List - Wireshark Style */
       .packet-panel {
-        margin-bottom: 16px;
+        margin-bottom: 0;
         background: #fefefe;
       }
       .packet-list-container {
-        max-height: 300px;
+        max-height: 250px;
         overflow-y: auto;
         background: #fff;
         border-top: 2px solid #1f2937;
@@ -776,11 +829,30 @@ function updateResultsUI() {
   if (grid) grid.innerHTML = renderResultsGrid();
 }
 
+// Load Chart.js dynamically
+function loadChartJs() {
+  return new Promise((resolve) => {
+    if (typeof Chart !== 'undefined') {
+      resolve();
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+    script.onload = () => resolve();
+    script.onerror = () => {
+      console.error('[CBS] Failed to load Chart.js');
+      resolve();
+    };
+    document.head.appendChild(script);
+  });
+}
+
 // Initialize Chart.js charts
-function initCharts() {
-  // Wait for Chart.js to load
+async function initCharts() {
+  await loadChartJs();
+
   if (typeof Chart === 'undefined') {
-    setTimeout(initCharts, 100);
+    console.error('[CBS] Chart.js not available');
     return;
   }
 
@@ -899,31 +971,52 @@ function addThroughputSample() {
 }
 
 // Packet list functions
-function addPacket(pkt) {
-  packetList.unshift(pkt);
-  if (packetList.length > MAX_PACKETS) packetList.pop();
-  renderPacketList();
+function addTxPacket(pkt) {
+  txPacketList.unshift(pkt);
+  if (txPacketList.length > MAX_PACKETS) txPacketList.pop();
+  renderTxPacketList();
 }
 
-function renderPacketList() {
-  const body = document.getElementById('packet-body');
+function addRxPacket(pkt) {
+  rxPacketList.unshift(pkt);
+  if (rxPacketList.length > MAX_PACKETS) rxPacketList.pop();
+  renderRxPacketList();
+}
+
+function renderTxPacketList() {
+  const body = document.getElementById('tx-packet-body');
   if (!body) return;
 
-  body.innerHTML = packetList.slice(0, 100).map((p, i) => `
+  body.innerHTML = txPacketList.slice(0, 50).map((p, i) => `
     <tr>
-      <td class="col-no">${packetList.length - i}</td>
+      <td class="col-no">${txPacketList.length - i}</td>
       <td class="col-time">${p.time}</td>
       <td class="col-tc"><span class="pkt-tc" style="background: ${TC_COLORS[p.tc]}">${p.tc}</span></td>
-      <td class="col-src">${p.src}</td>
-      <td class="col-dst">${p.dst}</td>
-      <td class="col-proto">${p.proto}</td>
       <td class="col-len">${p.len}</td>
       <td class="col-info">${p.info}</td>
     </tr>
   `).join('');
 
-  const countEl = document.getElementById('pkt-count');
-  if (countEl) countEl.textContent = `${packetList.length} packets`;
+  const countEl = document.getElementById('tx-pkt-count');
+  if (countEl) countEl.textContent = `${txPacketList.length} packets`;
+}
+
+function renderRxPacketList() {
+  const body = document.getElementById('rx-packet-body');
+  if (!body) return;
+
+  body.innerHTML = rxPacketList.slice(0, 50).map((p, i) => `
+    <tr>
+      <td class="col-no">${rxPacketList.length - i}</td>
+      <td class="col-time">${p.time}</td>
+      <td class="col-tc"><span class="pkt-tc" style="background: ${TC_COLORS[p.tc]}">${p.tc}</span></td>
+      <td class="col-len">${p.len}</td>
+      <td class="col-info">${p.info}</td>
+    </tr>
+  `).join('');
+
+  const countEl = document.getElementById('rx-pkt-count');
+  if (countEl) countEl.textContent = `${rxPacketList.length} packets`;
 }
 
 // API functions
@@ -1005,8 +1098,11 @@ async function startTest() {
   // Reset stats
   rxTcStats = {};
   txTcStats = {};
-  packetList = [];
+  txPacketList = [];
+  rxPacketList = [];
   throughputHistory = [];
+  renderTxPacketList();
+  renderRxPacketList();
   if (throughputChart) {
     throughputChart.data.labels = [];
     throughputChart.data.datasets.forEach(ds => ds.data = []);
@@ -1064,7 +1160,9 @@ function updateTestUI() {
 function handleStats(data) {
   if (!testRunning) return;
 
-  // Update RX stats
+  const now = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
+
+  // Update RX stats and add RX packets
   if (data.tc) {
     for (const [tc, s] of Object.entries(data.tc)) {
       const tcNum = parseInt(tc);
@@ -1073,20 +1171,28 @@ function handleStats(data) {
         kbps: s.kbps || 0
       };
 
-      // Add to packet list (simulated based on stats)
+      // Add RX packet
       if (s.count > 0) {
-        const now = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
-        addPacket({
+        addRxPacket({
           time: now,
           tc: tcNum,
-          src: '192.168.100.1',
-          dst: '192.168.100.2',
-          proto: 'UDP',
           len: 1000,
-          info: `VLAN 100, PCP ${tcNum}, ${(s.kbps || 0).toFixed(0)} kbps`
+          info: `RX ${(s.kbps || 0).toFixed(0)} kbps (${s.count} pkts)`
         });
       }
     }
+  }
+
+  // Add TX packets (based on selected TCs)
+  for (const tc of selectedTCs) {
+    const pps = parseInt(document.getElementById('pps')?.value) || 8000;
+    const ppsPerTc = Math.floor(pps / selectedTCs.length);
+    addTxPacket({
+      time: now,
+      tc: tc,
+      len: 1000,
+      info: `TX ~${ppsPerTc} pps`
+    });
   }
 
   updateConfigUI();
@@ -1135,10 +1241,17 @@ function setupEvents() {
   document.getElementById('load-device-btn')?.addEventListener('click', loadStatus);
   document.getElementById('start-btn')?.addEventListener('click', startTest);
   document.getElementById('stop-btn')?.addEventListener('click', stopTest);
-  document.getElementById('clear-pkts')?.addEventListener('click', () => {
-    packetList = [];
-    renderPacketList();
+
+  // Clear packet lists
+  document.getElementById('clear-tx-pkts')?.addEventListener('click', () => {
+    txPacketList = [];
+    renderTxPacketList();
   });
+  document.getElementById('clear-rx-pkts')?.addEventListener('click', () => {
+    rxPacketList = [];
+    renderRxPacketList();
+  });
+
   document.getElementById('analyze-btn')?.addEventListener('click', updateResultsUI);
 
   // Presets
@@ -1163,10 +1276,12 @@ function setupEvents() {
     }
   });
 
-  // Export packets
+  // Export packets (both TX and RX)
   document.getElementById('export-pkts')?.addEventListener('click', () => {
-    const csv = 'No,Time,TC,Source,Destination,Protocol,Length,Info\n' +
-      packetList.map((p, i) => `${i + 1},${p.time},${p.tc},${p.src},${p.dst},${p.proto},${p.len},"${p.info}"`).join('\n');
+    let csv = 'Type,No,Time,TC,Length,Info\n';
+    csv += txPacketList.map((p, i) => `TX,${i + 1},${p.time},${p.tc},${p.len},"${p.info}"`).join('\n');
+    csv += '\n';
+    csv += rxPacketList.map((p, i) => `RX,${i + 1},${p.time},${p.tc},${p.len},"${p.info}"`).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1189,7 +1304,10 @@ export async function init(appState, deps) {
   await loadStatus();
 
   // Initialize charts after DOM is ready
-  setTimeout(initCharts, 200);
+  setTimeout(async () => {
+    await initCharts();
+    updateCharts();
+  }, 200);
 
   // WebSocket handlers
   if (ws) {
